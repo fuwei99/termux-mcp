@@ -2,6 +2,7 @@
 # token 属于 lovevertex159@gmail.com 专属分配给备用机 Termux MCP
 version: "2"
 authtoken: 3HOm8UY4VIsnoB6NlW0bQQWptv7_2h88vqhxAMETAMbco4Lus
+region: ap
 web_addr: 127.0.0.1:4040
 log: stdout
 log_level: info

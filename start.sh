@@ -11,9 +11,20 @@ mkdir -p logs
 PORT="${TERMUX_MCP_PORT:-8996}"
 TOKEN="${TERMUX_MCP_TOKEN:-wei123..}"
 
-# 1. 检查并停止旧进程
-pkill -f "termux_mcp.py" >/dev/null 2>&1
-sleep 0.5
+# 0. 修复 Termux DNS 配置 (防止 Go/ngrok 报 [::1]:53 connection refused)
+if [ -n "$PREFIX" ] && [ -d "$PREFIX/etc" ]; then
+    mkdir -p "$PREFIX/etc"
+    if [ ! -s "$PREFIX/etc/resolv.conf" ] || grep -q "::1" "$PREFIX/etc/resolv.conf"; then
+        echo "nameserver 223.5.5.5" > "$PREFIX/etc/resolv.conf"
+        echo "nameserver 119.29.29.29" >> "$PREFIX/etc/resolv.conf"
+        echo "nameserver 8.8.8.8" >> "$PREFIX/etc/resolv.conf"
+    fi
+fi
+
+# 1. 检查并彻底停止旧进程
+pkill -9 -f "termux_mcp.py" >/dev/null 2>&1
+pkill -9 -f "ngrok" >/dev/null 2>&1
+sleep 1
 
 # 2. 启动 MCP Server (后台)
 echo "[1/3] 启动 Termux MCP Server (端口 $PORT)..."
