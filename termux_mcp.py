@@ -57,6 +57,41 @@ ALLOWED_ROOTS = [p.strip() for p in _raw_roots.split(":") if p.strip()]
 OUTPUT_MAX = 25000            # 单次工具输出最大字符数
 PROTOCOL_VERSION = "2024-11-05"
 
+# ---------- 全权限 proot 沙箱(伪 root + /workspace 虚拟根) ----------
+PREFIX = os.environ.get("PREFIX") or "/data/data/com.termux/files/usr"
+HOME_DIR = os.environ.get("HOME") or "/data/data/com.termux/files/home"
+WORKSPACE_ROOT = Path(os.environ.get("MCP_WORKSPACE_ROOT") or f"{HOME_DIR}/workspace")
+try:
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+_proot_bin = shutil.which("proot") or f"{PREFIX}/bin/proot"
+USE_PROOT = (os.environ.get("TERMUX_MCP_PROOT", "1").lower() not in ("0", "false", "no", "off")
+             and os.path.exists(_proot_bin))
+# 额外挂载: "宿主路径:容器路径,宿主路径:容器路径"
+_extra_binds = [b.strip() for b in os.environ.get("TERMUX_MCP_BINDS", "").split(",") if b.strip()]
+
+
+def _proot_argv(shell_bin: str, command: str, cwd: Optional[str]) -> list[str]:
+    """构造 proot 命令行: --root-id 伪 root, / 可写, $HOME/workspace 映射为 /workspace。"""
+    argv = [_proot_bin, "--root-id"]
+    binds = [
+        "/system:/system", "/vendor:/vendor", "/data:/data", "/apex:/apex",
+        "/linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt",
+        "/storage:/storage", "/dev:/dev", "/proc:/proc",
+        f"{PREFIX}:/usr", f"{PREFIX}/bin:/bin", f"{PREFIX}/etc:/etc",
+        f"{PREFIX}/lib:/lib", f"{PREFIX}/share:/share",
+        f"{PREFIX}/tmp:/tmp", f"{PREFIX}/var:/var",
+        f"{WORKSPACE_ROOT}:/workspace",
+    ] + _extra_binds
+    for b in binds:
+        host = b.split(":", 1)[0]
+        if os.path.exists(host):
+            argv += ["-b", b]
+    argv += ["-r", f"{PREFIX}/..", "--cwd=" + (cwd or str(WORKSPACE_ROOT))]
+    argv += [shell_bin, "-c", command]
+    return argv
+
 SESSIONS: dict[str, queue.Queue[dict]] = {}
 SESSIONS_LOCK = threading.Lock()
 
@@ -82,7 +117,15 @@ def decode_bytes(b: bytes) -> str:
 
 
 def check_path(raw: str) -> Path:
-    p = Path(raw).expanduser()
+    p = Path(str(raw)).expanduser()
+    # /workspace 及其子路径 -> 宿主真实目录(与 proot 内视角保持一致)
+    s = p.as_posix()
+    if s == "/workspace":
+        p = WORKSPACE_ROOT
+    elif s.startswith("/workspace/"):
+        p = WORKSPACE_ROOT / s[len("/workspace/"):]
+    elif not p.is_absolute():
+        p = WORKSPACE_ROOT / p
     if ALLOWED_ROOTS:
         ok = False
         for root in ALLOWED_ROOTS:
@@ -102,19 +145,35 @@ def check_path(raw: str) -> Path:
 # 工具实现
 # ============================================================
 
-def _run_shell(command: str, cwd: str = "", timeout: int = 120) -> dict:
-    shell_bin = os.environ.get("SHELL") or "/data/data/com.termux/files/usr/bin/bash"
+def _run_shell(command: str, cwd: str = "", timeout: int = 120,
+               proot: Optional[bool] = None) -> dict:
+    shell_bin = os.environ.get("SHELL") or f"{PREFIX}/bin/bash"
     if not os.path.exists(shell_bin):
         shell_bin = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
-    
+
     cwd_p = cwd or None
     if cwd_p:
         cwd_p = str(check_path(cwd_p))
-    
+
+    want_proot = USE_PROOT if proot is None else bool(proot)
+    if want_proot and os.path.exists(_proot_bin):
+        # proot 内部用容器视角的 cwd: 宿主 workspace 路径反向映射回 /workspace
+        inner = cwd_p or str(WORKSPACE_ROOT)
+        try:
+            rel = Path(inner).resolve().relative_to(WORKSPACE_ROOT.resolve())
+            inner = "/workspace" + ("/" + rel.as_posix() if rel.as_posix() != "." else "")
+        except (ValueError, OSError):
+            pass
+        argv = _proot_argv(shell_bin, command, inner)
+        popen_cwd = None
+    else:
+        argv = [shell_bin, "-c", command]
+        popen_cwd = cwd_p
+
     try:
         proc = subprocess.Popen(
-            [shell_bin, "-c", command],
-            cwd=cwd_p,
+            argv,
+            cwd=popen_cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -144,21 +203,53 @@ def _run_shell(command: str, cwd: str = "", timeout: int = 120) -> dict:
     }
 
 
-def tool_shell(command: str, cwd: str = "", timeout: int = 120) -> dict:
-    """在 Termux/Linux 上执行 bash/sh 命令。"""
-    return _run_shell(command, cwd, timeout)
+def tool_shell(command: str, cwd: str = "", timeout: int = 120,
+               proot: Optional[bool] = None) -> dict:
+    """在 Termux/Linux 上执行 bash/sh 命令。默认跑在 proot 全权限沙箱(uid=0, / 可写)。"""
+    return _run_shell(command, cwd, timeout, proot)
 
 
-def tool_read_file(path: str, offset: int = 0, limit: int = 65536) -> dict:
-    """读取文本文件, offset/limit 为字节偏移, 默认 64KB。"""
-    p = check_path(path)
-    if not p.is_file():
-        raise ValueError(f"文件不存在: {path}")
-    with open(p, "rb") as f:
-        f.seek(max(0, offset))
-        data = f.read(max(1, min(limit, 4 * 1024 * 1024)))
-    text = decode_bytes(data)
-    return {"path": str(p), "offset": offset, "text": clip(text, OUTPUT_MAX * 2), "bytes": len(data)}
+def tool_read_file(path: str = "", offset: int = 0, limit: int = 65536,
+                   paths: Optional[list] = None, start_line: int = 0,
+                   line_count: int = 0, max_chars: int = 0, **_kw) -> dict:
+    """读取文本文件。支持 offset/limit(字节) 或 start_line/line_count(行)，可批量 paths。"""
+    targets = [t for t in ([path] if path else []) + list(paths or []) if t]
+    if not targets:
+        raise ValueError("需要 path 或 paths")
+    hard = OUTPUT_MAX * 2
+    cap = min(max_chars, hard) if max_chars else hard
+    per = max(400, cap // len(targets)) if len(targets) > 1 else cap
+    items: list[dict] = []
+    for t in targets:
+        p = check_path(t)
+        item: dict[str, Any] = {"path": str(p)}
+        if not p.is_file():
+            item["error"] = "文件不存在"
+            items.append(item)
+            continue
+        if start_line or line_count:
+            lc = max(1, min(line_count or 400, 2000))
+            s = max(1, start_line or 1)
+            out: list[str] = []
+            with open(p, "rb") as f:
+                for n, raw in enumerate(f, 1):
+                    if n < s:
+                        continue
+                    if len(out) >= lc:
+                        break
+                    out.append(f"{n}\t{decode_bytes(raw).rstrip(chr(10))}")
+            item.update(start_line=s, lines=len(out),
+                        text=clip("\n".join(out), per))
+        else:
+            with open(p, "rb") as f:
+                f.seek(max(0, offset))
+                data = f.read(max(1, min(limit, 4 * 1024 * 1024)))
+            item.update(offset=offset, bytes=len(data),
+                        text=clip(decode_bytes(data), per))
+        items.append(item)
+    if len(items) == 1:
+        return items[0]
+    return {"count": len(items), "files": items}
 
 
 def tool_write_file(path: str, text: str, overwrite: bool = True) -> dict:
@@ -693,28 +784,32 @@ def tool_codex_patch(patch: str, cwd: str = "", dry_run: bool = False,
 TOOLS: list[dict] = [
     {
         "name": "shell",
-        "description": "在 Termux / Linux 上执行 bash/sh 命令, 返回 stdout/stderr/exit_code。",
+        "description": "在 Termux / Android 上执行 bash 命令。默认跑在 proot 全权限沙箱(uid=0, / 可写, 宿主 ~/workspace 映射为 /workspace)。proot=false 可回到原生 Termux 环境。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要执行的 Shell 命令"},
-                "cwd": {"type": "string", "description": "工作目录(可选)"},
+                "cwd": {"type": "string", "description": "工作目录(可选), 相对路径基于 /workspace"},
                 "timeout": {"type": "integer", "description": "超时秒数, 默认 120", "default": 120},
+                "proot": {"type": "boolean", "description": "是否用 proot 全权限沙箱, 默认 true"},
             },
             "required": ["command"],
         },
     },
     {
         "name": "read_file",
-        "description": "读取文本文件。offset/limit 为字节偏移, 默认 64KB。",
+        "description": "读取文本文件。两种模式: offset/limit(字节偏移) 或 start_line/line_count(行号, 带行号输出)。paths 可一次读多个文件。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "批量读取"},
                 "offset": {"type": "integer", "default": 0},
                 "limit": {"type": "integer", "default": 65536},
+                "start_line": {"type": "integer", "description": "起始行(1-based)"},
+                "line_count": {"type": "integer", "description": "最多读多少行, 默认 400"},
+                "max_chars": {"type": "integer", "description": "输出字符上限"},
             },
-            "required": ["path"],
         },
     },
     {
