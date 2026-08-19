@@ -34,10 +34,17 @@ echo "      MCP PID: $MCP_PID"
 
 sleep 1
 
-# 检查 MCP 是否正常启动
-if curl -s "http://127.0.0.1:$PORT/health" | grep -q '"ok":true'; then
-    echo "      ✅ MCP Server 本地健康检查通过: http://127.0.0.1:$PORT/health"
-else
+# 检查 MCP 是否正常启动 (轮询 3 次)
+MCP_OK=0
+for i in {1..3}; do
+    sleep 1
+    if curl -s "http://127.0.0.1:$PORT/health" | grep -q '"ok":true'; then
+        echo "      ✅ MCP Server 本地健康检查通过: http://127.0.0.1:$PORT/health"
+        MCP_OK=1
+        break
+    fi
+done
+if [ $MCP_OK -eq 0 ]; then
     echo "      ⚠️ MCP Server 似乎未就绪, 请检查 logs/mcp.log"
 fi
 
@@ -50,10 +57,16 @@ elif [ -x "$DIR/ngrok" ]; then
 fi
 
 if [ -f "ngrok.yml" ] && [ -n "$NGROK_BIN" ]; then
-    echo "[2/3] 启动 ngrok 公网隧道 (lovevertex159 账号)..."
-    pkill -f "ngrok" >/dev/null 2>&1
+    echo "[2/3] 启动 ngrok 公网隧道 (dashmuse123 账号)..."
+    pkill -9 -f "ngrok" >/dev/null 2>&1
     sleep 0.5
-    $NGROK_BIN start --config ngrok.yml termux-mcp > logs/ngrok.log 2>&1 &
+    
+    # 若有 termux-chroot, 用它包裹以让 /etc/resolv.conf 生效, 避免 Go DNS 报 [::1]:53 错误
+    if command -v termux-chroot >/dev/null 2>&1; then
+        termux-chroot $NGROK_BIN start --config "$DIR/ngrok.yml" termux-mcp > "$DIR/logs/ngrok.log" 2>&1 &
+    else
+        $NGROK_BIN start --config "$DIR/ngrok.yml" termux-mcp > "$DIR/logs/ngrok.log" 2>&1 &
+    fi
     
     # 轮询等待 ngrok 隧道建立 (最多等 8 秒)
     TUNNEL_URL=""

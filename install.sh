@@ -10,7 +10,7 @@ cd "$DIR"
 
 echo "=== [1/6] 更新基础软件包 ==="
 pkg update -y
-pkg install -y python git curl tar ripgrep openssh termux-api
+pkg install -y python git curl tar ripgrep openssh termux-api proot
 
 echo "=== [2/6] 检测并安装 ngrok 隧道工具 ==="
 if ! command -v ngrok >/dev/null 2>&1 && [ ! -f "$DIR/ngrok" ]; then
