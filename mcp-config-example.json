@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "termux-remote": {
+      "type": "sse",
+      "url": "https://<你的ngrok公网地址>.ngrok-free.dev/sse",
+      "headers": {
+        "Authorization": "Bearer wei123..",
+        "ngrok-skip-browser-warning": "true"
+      }
+    }
+  }
+}

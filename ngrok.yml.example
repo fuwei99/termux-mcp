@@ -1,0 +1,13 @@
+# ngrok 隧道配置 —— 将备用机 Termux 端口 (8996) 暴露为公网 https
+# 使用: 复制本文件为 ngrok.yml, 填入你的 authtoken (来自 https://dashboard.ngrok.com 或 token 池)
+version: "2"
+authtoken: <YOUR_AUTHTOKEN>
+web_addr: 127.0.0.1:4040
+log: stdout
+log_level: info
+
+tunnels:
+  termux-mcp:
+    proto: http
+    addr: 8996
+    # static_domain: <如果分配了静态域名可填在这>
