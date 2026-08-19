@@ -40,13 +40,20 @@ fi
 
 if [ -f "ngrok.yml" ] && [ -n "$NGROK_BIN" ]; then
     echo "[2/3] 启动 ngrok 公网隧道 (lovevertex159 账号)..."
-    pkill -f "ngrok.*start" >/dev/null 2>&1
-    pkill -f "ngrok.*$PORT" >/dev/null 2>&1
+    pkill -f "ngrok" >/dev/null 2>&1
+    sleep 0.5
     $NGROK_BIN start --config ngrok.yml termux-mcp > logs/ngrok.log 2>&1 &
-    sleep 3
     
-    # 尝试读取 ngrok 隧道公网地址
-    TUNNEL_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"https://[^"]*"' | head -n 1 | cut -d '"' -f 4)
+    # 轮询等待 ngrok 隧道建立 (最多等 8 秒)
+    TUNNEL_URL=""
+    for i in {1..8}; do
+        sleep 1
+        TUNNEL_URL=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https://[^"]*"' | head -n 1 | cut -d '"' -f 4)
+        if [ -n "$TUNNEL_URL" ]; then
+            break
+        fi
+    done
+
     if [ -n "$TUNNEL_URL" ]; then
         echo "[3/3] 🌐 公网访问地址: $TUNNEL_URL/sse"
         echo ""
@@ -59,7 +66,8 @@ if [ -f "ngrok.yml" ] && [ -n "$NGROK_BIN" ]; then
         echo "   ngrok-skip-browser-warning: true"
         echo "============================================================"
     else
-        echo "      ℹ️ ngrok 已后台启动, 如需查看公网地址可执行: curl -s 127.0.0.1:4040/api/tunnels"
+        echo "      ⚠️ ngrok 未能在 8 秒内建立隧道, 请查看 logs/ngrok.log:"
+        tail -n 10 logs/ngrok.log 2>/dev/null
     fi
 else
     echo "[2/3] ℹ️ 未发现 ngrok 二进制或 ngrok.yml"

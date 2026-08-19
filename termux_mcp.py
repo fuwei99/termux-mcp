@@ -1045,13 +1045,13 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global HOST, PORT, AUTH_TOKEN
     parser = argparse.ArgumentParser(description="Termux MCP Server")
     parser.add_argument("--host", default=HOST, help="监听地址 (默认 0.0.0.0)")
     parser.add_argument("--port", type=int, default=PORT, help=f"监听端口 (默认 {PORT})")
     parser.add_argument("--token", default=AUTH_TOKEN, help="鉴权 Bearer token (默认 wei123..)")
     args = parser.parse_args()
 
-    global HOST, PORT, AUTH_TOKEN
     HOST = args.host
     PORT = args.port
     AUTH_TOKEN = args.token
