@@ -26,9 +26,11 @@ if ! command -v ngrok >/dev/null 2>&1 && [ ! -f "$DIR/ngrok" ]; then
 
     if [ -n "$NGROK_URL" ]; then
         echo "      正在下载 ngrok ($ARCH)..."
-        curl -sSL "$NGROK_URL" -o /tmp/ngrok.tgz
-        tar -xzf /tmp/ngrok.tgz -C "$DIR"
-        rm -f /tmp/ngrok.tgz
+        # 注意: Termux 的 /tmp 可能是只读, 下载到项目目录再解压
+        NGROK_TGZ="$DIR/ngrok.tgz"
+        curl -sSL "$NGROK_URL" -o "$NGROK_TGZ"
+        tar -xzf "$NGROK_TGZ" -C "$DIR"
+        rm -f "$NGROK_TGZ"
         chmod +x "$DIR/ngrok"
         
         # 尝试软链接到 PATH
