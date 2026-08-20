@@ -7,3 +7,6 @@ logs/
 .termux_token
 .DS_Store
 ngrok
+processes.jsonc
+processes.json
+ngrok.runtime.yml

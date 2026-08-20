@@ -1,0 +1,67 @@
+// ============================================================
+// Termux 守护进程表  ——  复制为 processes.jsonc 后按机器改
+//     cp processes.jsonc.example processes.jsonc
+// 由 supervisor.py 每 15s 巡一遍, 死了自动拉起。
+// 从此重启服务 = 直接 pkill, 等几秒它自己回来。
+//
+// check 三种判活方式(可组合, 全满足才算活):
+//   {"http": "http://127.0.0.1:8994/health"}   健康检查(最准)
+//   {"port": 8996}                             端口在听
+//   {"pgrep": "hub.py"}                        进程名匹配
+// ============================================================
+{
+  "version": 1,
+  "processes": [
+    {
+      "id": "termux-mcp",
+      "name": "Termux MCP Server (本机能力, 端口 8996)",
+      "enabled": true,
+      "command": "bash run-mcp.sh",
+      "cwd": ".",
+      "check": { "http": "http://127.0.0.1:8996/health" },
+      "grace": 12,
+      "restartDelay": 2,
+      "daysOfWeek": [1, 2, 3, 4, 5, 6, 7],
+      "startMinutes": 0,
+      "endMinutes": 1440,
+      "maxConsecutiveStartFailures": 0    // 0 = 永不放弃, 一直重试
+    },
+    {
+      // 母节点专属; 子节点把 enabled 改 false
+      "id": "termux-hub",
+      "name": "Termux MCP Hub 母节点 (转发所有设备, 端口 8994)",
+      "enabled": true,
+      "command": "bash run-hub.sh",
+      "cwd": ".",
+      "check": { "http": "http://127.0.0.1:8994/health" },
+      "grace": 12,
+      "restartDelay": 2,
+      "maxConsecutiveStartFailures": 0
+    },
+    {
+      // ngrok 最容易被 HyperOS 杀, 守护它才是这套东西的主要意义
+      // 判活用 4040 本地管理端口: ngrok agent 活着才会监听它
+      "id": "ngrok",
+      "name": "ngrok 隧道 (按 config.jsonc 的 mode 暴露 hub 或 mcp 端口)",
+      "enabled": true,
+      "command": "bash run-ngrok.sh",
+      "cwd": ".",
+      "check": { "port": 4040 },
+      "grace": 25,        // ngrok 建隧道慢, 多给点时间
+      "restartDelay": 5,
+      "maxConsecutiveStartFailures": 0
+    },
+    {
+      // 可选: 定期续 wake-lock, 防系统休眠掐网络
+      "id": "wake-lock",
+      "name": "Termux Wake Lock 续命",
+      "enabled": true,
+      "command": "termux-wake-lock && sleep 3600",
+      "cwd": ".",
+      "check": { "pgrep": "sleep 3600" },
+      "grace": 5,
+      "restartDelay": 2,
+      "maxConsecutiveStartFailures": 0
+    }
+  ]
+}
