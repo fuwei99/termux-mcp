@@ -321,20 +321,23 @@ def _device_prop() -> dict:
     return prop
 
 
-# 子节点工具名 <-> 母节点暴露名。默认加 termux_ 前缀,
-# 但 termux_api 本身已带 termux 字样, 特例成 termux_android_api, 免得叫 termux_termux_api。
-_EXPOSE = {"termux_api": "termux_android_api"}
-_REMOTE = {v: k for k, v in _EXPOSE.items()}
+# 工具名直接透传子节点原名, 不加前缀。
+# 理由: Rikkahub 侧 MCP 本身已命名为 termux, 再加前缀会变成
+# mcp__termux__termux_write_file 这种叠字, 自己调都嫌啰唢。
+# 保持和子节点直连时一模一样的名字(write_file / read_file / shell ...),
+# 从直连改成过母节点时, 除了多一个 device 参数, 其余使用习惯不变。
+_RESERVED = {"devices"}          # 母节点自己的工具, 不转发
 
 
 def _expose_name(remote: str) -> str:
-    return _EXPOSE.get(remote) or f"termux_{remote}"
+    return remote
 
 
 def _remote_name(exposed: str) -> str:
-    if exposed in _REMOTE:
-        return _REMOTE[exposed]
-    return exposed[len("termux_"):] if exposed.startswith("termux_") else exposed
+    # 兼容旧的 termux_ 前缀写法(客户端缓存了旧工具表时不致于直接报错)
+    if exposed.startswith("termux_") and exposed != "termux_api":
+        return exposed[len("termux_"):]
+    return exposed
 
 
 def _wrap(spec: dict) -> dict:
@@ -375,7 +378,7 @@ def gateway_tools(force: bool = False) -> list[dict]:
                 break
         wrapped = [_wrap(t) for t in upstream] if upstream else _fallback_specs()
         wrapped.insert(0, {
-            "name": "termux_devices",
+            "name": "devices",
             "description": "列出母节点已接入的所有 Termux 设备及在线状态、端点、工具数。"
                            "不确定设备名或怀疑某台掉线时先调它。",
             "inputSchema": {"type": "object", "properties": {
@@ -414,10 +417,8 @@ def tool_devices(probe: bool = True) -> dict:
 
 def dispatch_tool(name: str, args: dict) -> dict:
     args = dict(args or {})
-    if name == "termux_devices":
+    if name in ("devices", "termux_devices"):
         return tool_devices(bool(args.get("probe", True)))
-    if name != "termux_devices" and not (name.startswith("termux_") or name in _REMOTE):
-        return _text_result(f"未知工具: {name}", True)
     remote = _remote_name(name)
     device = str(args.pop("device", "") or "").strip()
     if not device:
