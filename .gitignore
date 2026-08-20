@@ -1,3 +1,5 @@
+config.jsonc
+config.json
 __pycache__/
 *.pyc
 *.pyo

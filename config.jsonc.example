@@ -1,0 +1,54 @@
+// ============================================================
+// Termux MCP 节点配置  ——  复制为 config.jsonc 后按机器改
+//     cp config.jsonc.example config.jsonc
+// 真实 config.jsonc 已被 .gitignore 忽略(内含 ngrok token), 别提交。
+// 支持 // 与 /* */ 注释、尾逗号。
+// ============================================================
+{
+  // ── mode: 这台机器扮演什么角色 ──────────────────────────
+  //   "child" = 子节点。只跑 termux_mcp.py, ngrok 暴露 ports.mcp。
+  //             Rikkahub 或母节点连它。绝大多数手机用这个。
+  //   "root"  = 母节点。跑 termux_mcp.py + hub.py, ngrok 暴露 ports.hub。
+  //             Rikkahub 只连它一个端点, 由它按 device 参数转发到下面 nodes。
+  "mode": "root",
+
+  // ngrok 授权 token。留空则沿用仓库自带的 ngrok.yml。
+  // ⚠️ 一个免费 token 同时只能在线一条隧道, 每台设备用各自的号。
+  "ngrok-authtoken": "",
+
+  // 隧道走哪个端口由 mode 决定: root→hub, child→mcp
+  "ports": {
+    "hub": 8994,   // hub.py 监听端口 (仅 root 用)
+    "mcp": 8996    // termux_mcp.py 监听端口 (两种模式都用)
+  },
+
+  // 母节点鉴权 token: Rikkahub 连 hub 时用的 Bearer。留空=不鉴权。
+  // 不写则回落到环境变量 TERMUX_MCP_TOKEN, 再不然默认 wei123..
+  "auth_token": "wei123..",
+
+  // ── nodes: 设备表, 只有 root 需要维护 ────────────────────
+  // key   = device 参数的值 (调工具时传 device: "k70")
+  // url   = 该设备 termux_mcp.py 的 SSE 端点; hub 内部会自动换成 /mcp 打无状态请求
+  //         本机节点写 127.0.0.1 —— 不过公网, 最快
+  // 其余键(Authorization / 任意 header)原样作为 HTTP header 透传
+  // enabled: false 可临时摘掉某台
+  "nodes": {
+    "k60": {
+      "url": "http://127.0.0.1:8996/sse",
+      "Authorization": "Bearer wei123..",
+      "note": "母节点本机 K60s (22021211RC), localhost 直连"
+    },
+    "k70": {
+      "url": "https://chant-enunciate-lushly.ngrok-free.dev/sse",
+      "Authorization": "Bearer wei123..",
+      "ngrok-skip-browser-warning": true,
+      "note": "主力机 K70 (HyperOS, 需保活六件套)"
+    }
+    // 新设备接入 = 在这里加一行, 母节点重启即生效, 不用改代码
+    // "k40": {
+    //   "url": "https://xxxx.ngrok-free.dev/sse",
+    //   "Authorization": "Bearer wei123..",
+    //   "note": "K40"
+    // }
+  }
+}
