@@ -40,13 +40,16 @@
     },
     {
       // ngrok 最容易被 HyperOS 杀, 守护它才是这套东西的主要意义
-      // 判活用 4040 本地管理端口: ngrok agent 活着才会监听它
+      // 判活必须用 tunnel 而不是 {"port":4040}: agent 可能进程活着、4040 在听、
+      // 但隧道早掉了(公网 ERR_NGROK_3200), 只看端口会误判成"还活着"而不重启。
+      // tunnel 会去 4040 API 查 tunnels 列表, 空列表 = 空壳 = 判死。
+      // 值可以写 true(有任意隧道即可)或域名片段(如 "chant-enunciate" 精确校验)。
       "id": "ngrok",
       "name": "ngrok 隧道 (按 config.jsonc 的 mode 暴露 hub 或 mcp 端口)",
       "enabled": true,
       "command": "bash run-ngrok.sh",
       "cwd": ".",
-      "check": { "port": 4040 },
+      "check": { "tunnel": true },
       "grace": 25,        // ngrok 建隧道慢, 多给点时间
       "restartDelay": 5,
       "maxConsecutiveStartFailures": 0

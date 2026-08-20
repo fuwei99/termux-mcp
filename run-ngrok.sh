@@ -18,10 +18,20 @@ else
   TUNNEL_PORT="$PORT"
 fi
 
-# ngrok agent 活着就会监听 4040, 已在跑就别重复起(免费号同 token 只允许一条在线)
-if curl -s -m 3 http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
-  echo "[run-ngrok] 4040 已在监听, 隧道在跑, 退出"
-  exit 0
+# ngrok agent 可能"进程活着、4040 在听、但隧道已经掉了"(公网返回 ERR_NGROK_3200),
+# 它跟服务器断开后不一定自己退出。所以判断依据是 tunnels 列表里有没有东西:
+#   有隧道 -> 真的在工作, 退出别打扰
+#   没隧道 -> agent 是个空壳, 必须先杀掉再重建(免费号同 token 只允许一条在线,
+#             不杀干净新的会因 ERR_NGROK_108 起不来)
+TUNNELS="$(curl -s -m 4 http://127.0.0.1:4040/api/tunnels 2>/dev/null)"
+if [ -n "$TUNNELS" ]; then
+  if echo "$TUNNELS" | grep -q '"public_url"'; then
+    echo "[run-ngrok] 隧道在跑, 退出: $(echo "$TUNNELS" | grep -o '"public_url":"[^"]*"' | head -1)"
+    exit 0
+  fi
+  echo "[run-ngrok] ⚠️ agent 活着但没有隧道(空壳), 杀掉重建"
+  pkill -f ngrok
+  sleep 3
 fi
 
 # DNS: Go 的解析器碰上不可达的首个 nameserver 会死等, 顺手校正

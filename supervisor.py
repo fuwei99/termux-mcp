@@ -160,6 +160,28 @@ def _pgrep_ok(pattern: str) -> bool:
     return False
 
 
+def _tunnel_ok(want: Any = True, timeout: float = 5.0) -> bool:
+    """查 ngrok agent 的 4040 API, 确认真的有建好的隔离。
+
+    为何不能只用 {"port": 4040}: agent 进程可以“活着、监听 4040、
+    但隔离已经掉了”(公网返回 ERR_NGROK_3200 就是这种)。它跟服务器
+    断开后不一定自己退出, 所以必须看 tunnels 列表里有没有东西。
+    """
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels",
+                                    timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return False
+    tunnels = data.get("tunnels") or []
+    if not tunnels:
+        return False
+    if isinstance(want, str) and want not in ("", "*", "any"):
+        return any(want in (t.get("public_url") or "") or want == t.get("name")
+                   for t in tunnels)
+    return True
+
+
 def is_alive(proc: dict) -> tuple[bool, str]:
     """返回 (是否存活, 判定依据描述)。多个 check 全部满足才算活。"""
     check = proc.get("check") or {}
@@ -174,6 +196,9 @@ def is_alive(proc: dict) -> tuple[bool, str]:
         elif kind == "port":
             ok = _port_ok(int(val))
             reasons.append(f"port({val})={'OK' if ok else 'DOWN'}")
+        elif kind == "tunnel":
+            ok = _tunnel_ok(val)
+            reasons.append(f"tunnel={'OK' if ok else 'DOWN'}")
         elif kind == "pgrep":
             ok = _pgrep_ok(str(val))
             reasons.append(f"pgrep({val})={'OK' if ok else 'DOWN'}")
