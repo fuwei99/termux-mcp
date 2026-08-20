@@ -55,13 +55,14 @@
       "maxConsecutiveStartFailures": 0
     },
     {
-      // 可选: 定期续 wake-lock, 防系统休眠掐网络
+      // 可选: 持有 wake-lock, 防系统休眠掐网络
+      // 判活串用脚本名而非 "sleep 3600" —— 后者太常见, 容易撞上别人的进程误判为活
       "id": "wake-lock",
       "name": "Termux Wake Lock 续命",
       "enabled": true,
-      "command": "termux-wake-lock && sleep 3600",
+      "command": "bash run-wakelock.sh",
       "cwd": ".",
-      "check": { "pgrep": "sleep 3600" },
+      "check": { "pgrep": "run-wakelock.sh" },
       "grace": 5,
       "restartDelay": 2,
       "maxConsecutiveStartFailures": 0

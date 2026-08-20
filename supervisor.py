@@ -138,23 +138,42 @@ def _port_ok(port: int, host: str = "127.0.0.1", timeout: float = 3.0) -> bool:
 
 
 def _pgrep_ok(pattern: str) -> bool:
+    """进程名匹配判活。
+
+    注意 pgrep -f 匹配整条命令行, 会把"包含该 pattern 的其他命令"也算进来
+    (比如守护器自己、或者 `bash -c 'pgrep -f xxx'` 这层壳), 造成
+    "明明死了却判活" 的自欺欺人。所以显式排除自己和常见的壳进程。
+    """
+    me = os.getpid()
+    ppid = os.getppid()
     exe = shutil.which("pgrep")
     if exe:
         try:
             r = subprocess.run([exe, "-f", pattern], capture_output=True, timeout=10)
-            if r.returncode == 0 and r.stdout.strip():
+            pids = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+            pids = [p for p in pids if p not in (me, ppid)]
+            if pids:
                 return True
-            if r.returncode == 1:
+            if r.returncode in (0, 1):
                 return False
         except Exception:
             pass
     # pgrep 不可用时退回 ps 扫描
     try:
         r = subprocess.run(["ps", "-ef"], capture_output=True, timeout=10)
-        me = str(os.getpid())
         for line in r.stdout.decode("utf-8", "replace").splitlines():
-            if pattern in line and "supervisor.py" not in line and me not in line.split()[:2]:
-                return True
+            if pattern not in line:
+                continue
+            cols = line.split()
+            try:
+                lp = int(cols[1])
+            except (IndexError, ValueError):
+                continue
+            if lp in (me, ppid):
+                continue
+            if "supervisor.py" in line and "supervisor.py" not in pattern:
+                continue
+            return True
     except Exception:
         pass
     return False
@@ -203,7 +222,10 @@ def is_alive(proc: dict) -> tuple[bool, str]:
             ok = _pgrep_ok(str(val))
             reasons.append(f"pgrep({val})={'OK' if ok else 'DOWN'}")
         else:
-            continue
+            # 未知判活方式必须报错判死, 不能默默 continue —— 配错一个字段名
+            # 就等于"永远判活", 守护器静默失效, 比直接报错危险得多。
+            reasons.append(f"⚠未知判活方式({kind}), 只支持 http/port/pgrep/tunnel")
+            return False, " ".join(reasons)
         if not ok:
             return False, " ".join(reasons)
     return True, " ".join(reasons) or "no-check"

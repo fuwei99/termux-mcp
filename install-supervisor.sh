@@ -35,6 +35,21 @@ PY
     fi
 else
     echo "      processes.jsonc 已存在, 保留不动"
+    # 迁移: 老版本 wake-lock 用 "sleep 3600" 作判活串, 太常见容易被别的进程撞上
+    # 造成"死了也判活"。换成独占的 run-wakelock.sh。
+    if grep -q '"pgrep": *"sleep 3600"' "$DIR/processes.jsonc" 2>/dev/null; then
+        python3 - "$DIR/processes.jsonc" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p, encoding='utf-8').read()
+t = t.replace('"command": "termux-wake-lock && sleep 3600"',
+              '"command": "bash run-wakelock.sh"')
+t = t.replace('"pgrep": "sleep 3600"', '"pgrep": "run-wakelock.sh"')
+open(p, 'w', encoding='utf-8').write(t)
+print("      已迁移 wake-lock 判活串 -> run-wakelock.sh (原 sleep 3600 易误判)")
+PY
+        pkill -f "sleep 3600" 2>/dev/null   # 杀掉老式 wake-lock, 让守护器用新方式重拉
+    fi
 fi
 
 # ── Termux:Boot ─────────────────────────────────────────────
