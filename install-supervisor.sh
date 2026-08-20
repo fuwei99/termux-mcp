@@ -50,6 +50,18 @@ print("      已迁移 wake-lock 判活串 -> run-wakelock.sh (原 sleep 3600 �
 PY
         pkill -f "sleep 3600" 2>/dev/null   # 杀掉老式 wake-lock, 让守护器用新方式重拉
     fi
+    # 迁移: ngrok 判活从 port(4040) 换成 tunnel —— agent 可能进程活着、4040 在听,
+    # 但隧道早已掉线(公网 ERR_NGROK_3200), 只看端口不会重启它。
+    if grep -q '"port": *4040' "$DIR/processes.jsonc" 2>/dev/null; then
+        python3 - "$DIR/processes.jsonc" <<'PY'
+import re, sys
+p = sys.argv[1]
+t = open(p, encoding='utf-8').read()
+t = re.sub(r'"check":\s*\{\s*"port":\s*4040\s*\}', '"check": { "tunnel": true }', t)
+open(p, 'w', encoding='utf-8').write(t)
+print("      已迁移 ngrok 判活 port(4040) -> tunnel (端口在听但隧道掉线时也能发现)")
+PY
+    fi
 fi
 
 # ── Termux:Boot ─────────────────────────────────────────────
