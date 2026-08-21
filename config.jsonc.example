@@ -16,6 +16,11 @@
   // ⚠️ 一个免费 token 同时只能在线一条隧道, 每台设备用各自的号。
   "ngrok-authtoken": "",
 
+  // ngrok 本地 web 面板端口。默认 4045。
+  // ⚠️ 同机共享内核: 宿主 proot 守护器(ngrok_tunnels.py)固定占 4040,
+  //    原生 Termux 的 ngrok 若也用 4040 会 bind 冲突, 必须避开。
+  "ngrok-web-port": 4045,
+
   // 隧道走哪个端口由 mode 决定: root→hub, child→mcp
   "ports": {
     "hub": 8994,   // hub.py 监听端口 (仅 root 用)
