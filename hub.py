@@ -336,10 +336,13 @@ _tools_lock = threading.Lock()
 
 def _device_prop() -> dict:
     names = list(CFG.nodes)
-    prop = {"type": "string", "description": "目标设备: " + (" / ".join(names) or "(未配置节点)")}
     if names:
-        prop["enum"] = names
-    return prop
+        lines = ["目标设备 (可选):"]
+        for n in names:
+            note = (CFG.nodes[n].get("note") or "").strip()
+            lines.append(f"- {n}" + (f": {note}" if note else ""))
+        return {"type": "string", "description": "\n".join(lines), "enum": names}
+    return {"type": "string", "description": "目标设备: (未配置节点)"}
 
 
 # 工具名直接透传子节点原名, 不加前缀。
