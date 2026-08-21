@@ -624,14 +624,18 @@ def tool_read_file(path: str = "", offset: int = 0, limit: int = 65536,
 
 
 def tool_write_file(path: str, text: str, overwrite: bool = True) -> dict:
-    """写入文本文件(utf-8)。自动创建父目录。"""
+    """写入文本文件(utf-8)。自动创建父目录。覆盖前自动备份原文件。"""
     p = check_path(path)
     if p.exists() and not overwrite:
         raise ValueError(f"文件已存在且 overwrite=False: {path}")
+    backup_id = _do_backup([p], "write_file") if p.exists() else None
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
-    return {"path": str(p), "bytes": p.stat().st_size}
+    result: dict[str, Any] = {"path": str(p), "bytes": p.stat().st_size}
+    if backup_id:
+        result["backup_id"] = backup_id
+    return result
 
 
 def tool_edit_file(path: str, old_text: str = "", new_text: str = "",
@@ -681,9 +685,14 @@ def tool_edit_file(path: str, old_text: str = "", new_text: str = "",
             raise ValueError("old_text 不能为空")
         total += apply_one(old_text, new_text, replace_all, expected_replacements)
 
+    # 改动前的原文已经在内存里(p.read_bytes()), 直接落盘备份
+    backup_id = _do_backup([p], "edit_file")
     with open(p, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
-    return {"path": str(p), "replacements": total, "bytes": p.stat().st_size}
+    result = {"path": str(p), "replacements": total, "bytes": p.stat().st_size}
+    if backup_id:
+        result["backup_id"] = backup_id
+    return result
 
 
 def tool_termux_api(command: str, args: Optional[list] = None) -> dict:
@@ -708,13 +717,8 @@ def tool_termux_api(command: str, args: Optional[list] = None) -> dict:
 
 
 def tool_open_path(target: str) -> dict:
-    """用 termux-open / xdg-open 打开文件或 URL。"""
-    opener = shutil.which("termux-open") or shutil.which("xdg-open")
-    if not opener:
-        raise ValueError("系统未找到 termux-open 或 xdg-open")
-    
-    subprocess.Popen([opener, target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"opened": target, "via": opener}
+    """[已废弃] 用 shell 跑 termux-open/xdg-open 即可。保留空实现避免旧调用报错。"""
+    return {"deprecated": True, "hint": "改用 shell: termux-open <target> 或 xdg-open <target>"}
 
 
 # ============================================================
@@ -848,10 +852,124 @@ def tool_grep(query: str, path: str = ".", output_mode: str = "files_with_matche
 
 
 # ============================================================
+# 统一备份系统 (对齐 RikkaHub workspace_backup 格式)
+#   <root>/<backupId>/manifest.json + files/<i>.txt
+#   write_file / edit_file / codex_patch 改动前自动留底, 可用 backup 后悔。
+# ============================================================
+
+BACKUP_ROOT = Path(os.environ.get(
+    "TERMUX_MCP_BACKUP_ROOT",
+    str(WORKSPACE_ROOT / ".rikkahub" / "backups")))
+BACKUP_MAX = 200  # 最多保留备份份数
+
+
+def _new_backup_id() -> str:
+    return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:4]}"
+
+
+def _do_backup(paths: "list[Path]", reason: str) -> Optional[str]:
+    """把给定文件(已存在的)拷进一个备份目录, 写 manifest, 返回 backup_id。"""
+    existing = [p for p in paths if p and p.exists() and p.is_file()]
+    if not existing:
+        return None
+    bid = _new_backup_id()
+    bdir = BACKUP_ROOT / bid
+    fdir = bdir / "files"
+    fdir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for i, p in enumerate(existing):
+        try:
+            rp = p.resolve()
+        except OSError:
+            rp = p
+        dst = fdir / f"{i}.txt"
+        try:
+            shutil.copy2(str(rp), str(dst))
+            size = dst.stat().st_size
+        except OSError:
+            continue
+        entries.append({
+            "path": str(rp), "existed": True,
+            "backupPath": str(dst), "sizeBytes": size})
+    if not entries:
+        shutil.rmtree(str(bdir), ignore_errors=True)
+        return None
+    manifest = {
+        "backupId": bid, "createdAt": int(time.time() * 1000),
+        "reason": reason, "entries": entries}
+    with open(bdir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    _prune_backups()
+    return bid
+
+
+def _prune_backups() -> None:
+    """按时间保留最近 BACKUP_MAX 份。"""
+    try:
+        dirs = [d for d in BACKUP_ROOT.iterdir() if d.is_dir()]
+    except OSError:
+        return
+    if len(dirs) <= BACKUP_MAX:
+        return
+    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for old in dirs[BACKUP_MAX:]:
+        shutil.rmtree(str(old), ignore_errors=True)
+
+
+def tool_backup(action: str = "list", backup_id: str = "",
+                files: "Optional[list[str]]" = None,
+                limit: int = 20) -> dict:
+    """备份管理: list(列出最近备份) / restore(回滚指定备份, files 可只回滚部分路径)。"""
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    if action == "restore":
+        if not backup_id:
+            raise ValueError("restore 需要 backup_id")
+        bdir = BACKUP_ROOT / backup_id
+        mf = bdir / "manifest.json"
+        if not mf.is_file():
+            raise ValueError(f"备份不存在: {backup_id}")
+        with open(mf, encoding="utf-8") as f:
+            manifest = json.load(f)
+        restore_set = set(files or [])
+        restored = []
+        for i, e in enumerate(manifest.get("entries", [])):
+            orig = e.get("path", "")
+            if restore_set and orig not in restore_set:
+                continue
+            src = Path(e.get("backupPath") or (bdir / "files" / f"{i}.txt"))
+            if not src.is_file():
+                continue
+            op = Path(orig)
+            op.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(op))
+            restored.append(orig)
+        return {"ok": True, "action": "restore", "backup_id": backup_id,
+                "restored": restored, "restored_count": len(restored)}
+    # list
+    dirs = sorted([d for d in BACKUP_ROOT.iterdir() if d.is_dir()],
+                  key=lambda d: d.stat().st_mtime, reverse=True)[:max(1, limit)]
+    items = []
+    for d in dirs:
+        mf = d / "manifest.json"
+        info: dict[str, Any] = {"backup_id": d.name}
+        if mf.is_file():
+            try:
+                with open(mf, encoding="utf-8") as f:
+                    m = json.load(f)
+                info["reason"] = m.get("reason", "")
+                info["created_at"] = m.get("createdAt")
+                info["files"] = [e.get("path") for e in m.get("entries", [])]
+            except Exception:
+                pass
+        items.append(info)
+    return {"count": len(items), "backups": items}
+
+
+# ============================================================
 # codex_patch (OpenAI Codex file-style patch, 纯 Python 解析)
 # ============================================================
 
-PATCH_BACKUP_ROOT = Path(__file__).resolve().parent / "logs" / "patch-backups"
+# 旧的 patch 专用备份已统一到上面的 BACKUP_ROOT
 
 
 def _find_sequence(lines: list[str], seq: list[str]) -> Optional[int]:
@@ -924,37 +1042,27 @@ def _parse_codex_patch(patch: str, base: Path) -> list[dict]:
     return ops
 
 
-def _patch_backup(ops: list[dict], base: Path) -> str:
-    bid = f"{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    d = PATCH_BACKUP_ROOT / bid
+def _patch_backup(ops: list[dict], base: Path) -> Optional[str]:
+    """统一备份: 把 ops 涉及的已存在文件留底, 返回 backup_id。"""
+    paths = []
     for op in ops:
-        p = op["path"]
-        if p.exists():
-            try:
-                rel = p.relative_to(base)
-            except ValueError:
-                rel = Path(p.name)
-            dest = d / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(p), str(dest))
-    return bid
+        p = op.get("path")
+        if p and p.exists():
+            paths.append(p)
+        if op.get("move_to") and op["move_to"].exists():
+            paths.append(op["move_to"])
+    return _do_backup(paths, "codex_patch")
 
 
 def _patch_restore(bid: str, base: Path) -> None:
-    d = PATCH_BACKUP_ROOT / bid
-    if not d.is_dir():
-        return
-    for f in d.rglob("*"):
-        if f.is_file():
-            orig = base / f.relative_to(d)
-            orig.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(f), str(orig))
+    """回滚整次备份(base 仅为兼容签名, 还原按 manifest 绝对路径)。"""
+    if bid:
+        tool_backup("restore", backup_id=bid)
 
 
 def _patch_cleanup(bid: str) -> None:
-    d = PATCH_BACKUP_ROOT / bid
-    if d.is_dir():
-        shutil.rmtree(str(d), ignore_errors=True)
+    """成功后保留备份(供手动后悔), 不再自动删除。"""
+    return None
 
 
 def _apply_codex_op(op: dict, base: Path, dry_run: bool) -> dict:
@@ -1149,17 +1257,6 @@ TOOLS: list[dict] = [
         },
     },
     {
-        "name": "open_path",
-        "description": "调用 termux-open 打开文件/URL。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "target": {"type": "string"},
-            },
-            "required": ["target"],
-        },
-    },
-    {
         "name": "grep",
         "description": "搜索文件内容 (ripgrep 后端)。output_mode: files_with_matches/content/count。",
         "inputSchema": {
@@ -1198,6 +1295,19 @@ TOOLS: list[dict] = [
             "required": ["patch"],
         },
     },
+    {
+        "name": "backup",
+        "description": "备份/后悔药: list 列出 write_file/edit_file/codex_patch 自动生成的备份; restore 用 backup_id 回滚(可只滚 files 指定路径)。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "restore"], "default": "list", "description": "list=列备份; restore=回滚"},
+                "backup_id": {"type": "string", "description": "restore 时必填"},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "restore 时只回滚这些路径(可选, 默认全部)"},
+                "limit": {"type": "integer", "default": 20, "description": "list 返回最近 N 份"},
+            },
+        },
+    },
 ]
 
 _TOOL_IMPL = {
@@ -1207,9 +1317,9 @@ _TOOL_IMPL = {
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
     "termux_api": tool_termux_api,
-    "open_path": tool_open_path,
     "grep": tool_grep,
     "codex_patch": tool_codex_patch,
+    "backup": tool_backup,
 }
 
 _GREP_ARG_ALIAS = {"-A": "after", "-B": "before", "-C": "context"}

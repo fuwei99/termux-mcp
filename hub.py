@@ -324,8 +324,10 @@ _FALLBACK_TOOLS = [
         "patch": {"type": "string"}}, ["patch"]),
     ("termux_api", "调用 Termux:API 设备能力", {
         "command": {"type": "string"}}, ["command"]),
-    ("open_path", "用 termux-open 打开文件/URL", {
-        "target": {"type": "string"}}, ["target"]),
+    ("backup", "备份/后悔药: list 列出自动备份, restore 回滚", {
+        "action": {"type": "string", "description": "list / restore"},
+        "backup_id": {"type": "string"},
+        "files": {"type": "array", "items": {"type": "string"}}}, []),
 ]
 
 _tools_cache: dict[str, Any] = {"ts": 0.0, "tools": [], "src": ""}

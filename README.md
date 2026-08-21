@@ -29,17 +29,18 @@ bash start.sh
 ## 🛠️ 工具清单 (mcp 9 个 + 母节点 devices = 10)
 
 1. **`shell`**：一次性执行 bash/sh 命令(subprocess, 跑完即销)。适合无状态命令。
-2. **`shell_session`**：常驻 pty bash 会话，cd/export/变量在同 session_id 间持久保持；哨兵协议，超时后 output_offset 续读，interrupt 发 Ctrl-C。
+2. **`shell_session`**：常驻 pty bash 会话，cd/export/变量在同 session_id 间持久；哨兵协议，超时 output_offset 续读，interrupt 发 Ctrl-C。
 3. **`read_file`**：读取任意文本文件（自动兼容各种编码）。
-4. **`write_file`**：写入文本文件，自动创建父级目录。
-5. **`edit_file`**：精确查找并替换文件内容（支持单次与批量 edits）。
-6. **`grep`**：ripgrep 极速代码/文本搜索（支持正则、文件类型过滤、上下文行）。
-7. **`codex_patch`**：OpenAI Codex file-style patch 解析与应用，带自动备份与失败自动回滚。
-8. **`termux_api`**：直接调用 Android 底层能力（toast 弹窗、剪贴板获取/设置、振动、通知、电池状态、WiFi 信息等）。
-9. **`open_path`**：调用 `termux-open` 打开 URL 或本地文件。
+4. **`write_file`**：写入文本文件，自动创建父目录，**覆盖前自动备份**。
+5. **`edit_file`**：精确查找替换（支持单次/批量 edits），**改动前自动备份**。
+6. **`grep`**：ripgrep 极速代码/文本搜索。
+7. **`codex_patch`**：Codex file-style patch，**自动备份**，失败可回滚。
+8. **`termux_api`**：Android 底层能力（toast、剪贴板、振动、通知、电池、WiFi 等）。
+9. **`backup`**：后悔药——`list` 列出 write/edit/codex_patch 的自动备份，`restore` 用 backup_id 回滚（可只滚指定文件）。
 10. **`devices`**（母节点 hub 层）：列出已接入设备及在线状态。
 
-> `ls` / `ps` / `uname` / `free` / `df` 等系统查询全部用 `shell` 直接跑命令。后台长任务用 `shell_session`（续读+still_running 覆盖）。
+> `ls`/`ps`/`uname`/`free`/`df` 用 `shell`；打开文件/URL 用 `shell` 跑 `termux-open`/`xdg-open`。
+> 备份存于 `~/.rikkahub/backups/<backupId>/`（manifest.json + files/），对齐 RikkaHub workspace 格式。
 
 ---
 
