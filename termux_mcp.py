@@ -232,6 +232,16 @@ class ShellSession:
             argv = [shell_bin, "--norc", "--noprofile", "--noediting"]
 
         master, slave = pty.openpty()
+        # 在启动 shell 前直接关掉 slave 的 ECHO, 避免首条命令在 stty -echo 生效前被回显
+        try:
+            attrs = termios.tcgetattr(slave)
+            attrs[3] = attrs[3] & ~(termios.ECHO | termios.ECHONL | termios.ECHOCTL
+                                    | termios.ECHOE | termios.ECHOK | termios.IXON)
+            # 保留 ISIG(让 Ctrl-C 能中断前台进程); 关 OPOST 避免 \n->\r\n 转换
+            attrs[1] = attrs[1] & ~(termios.OPOST)
+            termios.tcsetattr(slave, termios.TCSANOW, attrs)
+        except Exception:
+            pass
         # 设置 pty 窗口大小
         try:
             fcntl.ioctl(slave, termios.TIOCSWINSZ,
