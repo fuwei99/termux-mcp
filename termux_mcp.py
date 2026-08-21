@@ -26,17 +26,27 @@ Termux MCP Server —— 纯 Python 标准库, 自带 MCP 协议, 零第三方�
 from __future__ import annotations
 
 import argparse
+import base64
+import fcntl
 import json
 import os
 import queue
+import random
+import re
+import select
+import shlex
 import shutil
+import signal
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import traceback
 import urllib.parse
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -55,6 +65,14 @@ _raw_roots = os.environ.get("ALLOWED_ROOTS", "").replace(";", ":")
 ALLOWED_ROOTS = [p.strip() for p in _raw_roots.split(":") if p.strip()]
 OUTPUT_MAX = 25000            # 单次工具输出最大字符数
 PROTOCOL_VERSION = "2024-11-05"
+
+# ---------- 常驻会话配置 ----------
+SESSION_IDLE_TIMEOUT = 1800   # 空闲 30 分钟回收会话
+SESSION_MAX_LIFETIME = 7200   # 会话最长寿命 2 小时
+SESSION_OUTPUT_MAX = 200_000  # 单次命令输出上限(哨兵模式可续读, 不直接截断)
+BG_TASK_MAX_OUTPUT = 500_000  # 后台任务日志上限
+BG_TASK_IDLE_RECYCLE = 3600   # 后台任务完成后日志保留 1 小时
+BG_TASK_MAX_LIFETIME = 86400  # 后台任务最长寿命 24 小时
 
 # ---------- 全权限 proot 沙箱(伪 root + /workspace 虚拟根) ----------
 PREFIX = os.environ.get("PREFIX") or "/data/data/com.termux/files/usr"
@@ -141,7 +159,461 @@ def check_path(raw: str) -> Path:
 
 
 # ============================================================
-# 工具实现
+# 命令黑名单 —— 防呆, 不是安全边界
+# ============================================================
+
+_BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+/(?:\s|$)"), "rm -rf / 禁止"),
+    (re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\s+~(?:/|\s|$)"), "rm -rf ~ 禁止"),
+    (re.compile(r"\bmkfs\b"), "mkfs 禁止"),
+    (re.compile(r"\bdd\b.*\bof=/dev/"), "dd 写设备 禁止"),
+    (re.compile(r":\(\)\s*\{\s*:\|:&\s*\};:"), "fork bomb 禁止"),
+    (re.compile(r"\bshutdown\b"), "shutdown 禁止"),
+    (re.compile(r"\breboot\b"), "reboot 禁止"),
+    (re.compile(r">\s*/dev/sd[a-z]"), "直接写块设备 禁止"),
+]
+
+
+def assert_shell_command_allowed(command: str) -> None:
+    """简单静态检查, 拦 rm -rf / 之类的手滑命令。不做沙箱安全保证。"""
+    for pat, reason in _BLOCKED_PATTERNS:
+        if pat.search(command):
+            raise ValueError(f"命令被拒绝: {reason}")
+
+
+# ============================================================
+# 常驻 bash 会话 (pty + base64 + nonce 哨兵)
+# ============================================================
+
+class ShellSession:
+    """一个常驻 bash 进程, 通过 pty 通信。
+
+    命令用 base64 编码后 eval 执行, 避免引号/转义地狱;
+    结尾 printf 一个 __RK_<nonce>_<exitcode>__ 哨兵, 读到即本次结束。
+    """
+
+    def __init__(self, proot: bool = True, cwd: str = ""):
+        self.proot = proot
+        self.cwd = cwd
+        self.master_fd: Optional[int] = None
+        self.pid: Optional[int] = None
+        self.created = time.time()
+        self.last_used = time.time()
+        self.lock = threading.Lock()
+        self._start()
+
+    def _start(self) -> None:
+        shell_bin = os.environ.get("SHELL") or f"{PREFIX}/bin/bash"
+        if not os.path.exists(shell_bin):
+            shell_bin = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+
+        if self.proot and os.path.exists(_proot_bin):
+            inner = self.cwd or str(WORKSPACE_ROOT)
+            try:
+                rel = Path(inner).resolve().relative_to(WORKSPACE_ROOT.resolve())
+                inner = "/workspace" + ("/" + rel.as_posix() if rel.as_posix() != "." else "")
+            except (ValueError, OSError):
+                pass
+            # _proot_argv 末尾是 [shell, "-c", command]; 去掉后两个, 留 shell 做交互式
+            argv = _proot_argv(shell_bin, "", inner)
+            argv = argv[:-2]   # 丢 "-c", ""
+        else:
+            argv = [shell_bin]
+
+        master, slave = pty.openpty()
+        # 设置 pty 窗口大小
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", 40, 200, 0, 0))
+        except Exception:
+            pass
+
+        pid = os.fork()
+        if pid == 0:
+            os.close(master)
+            os.setsid()
+            # 把子进程的 controlling terminal 设为 slave pty
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            os.dup2(slave, 0)
+            os.dup2(slave, 1)
+            os.dup2(slave, 2)
+            if slave > 2:
+                os.close(slave)
+            # 设置 TERM
+            env = dict(os.environ)
+            env["TERM"] = "xterm-256color"
+            env["PS1"] = ""
+            try:
+                os.execvpe(argv[0], argv, env)
+            except Exception:
+                os._exit(1)
+        else:
+            os.close(slave)
+            self.master_fd = master
+            self.pid = pid
+
+        # 等待 shell 就绪, 发送 init 命令
+        time.sleep(0.3)
+        init = (
+            "PS1=''; set +m; stty -echo -onlcr -ixon isig 2>/dev/null; "
+            "printf '__RK_READY__\\n'"
+        )
+        try:
+            os.write(self.master_fd, (init + "\n").encode())
+        except Exception:
+            pass
+        # 读掉 init 输出
+        self._read_until(b"__RK_READY__", timeout=5.0)
+
+    def _read_until(self, sentinel: bytes, timeout: float = 120.0) -> tuple[bytes, bool, bytes]:
+        """读到 sentinel 或超时。
+
+        返回 (output_before_sentinel, timed_out, tail_after_sentinel)。
+        tail 包含 sentinel 之后同批读到的字节(用于解析 exit code)。
+        """
+        if self.master_fd is None:
+            return b"", False, b""
+        buf = b""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                r, _, _ = select.select([self.master_fd], [], [],
+                                        min(remaining, 1.0))
+                if not r:
+                    continue
+                try:
+                    chunk = os.read(self.master_fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if sentinel in buf:
+                    idx = buf.index(sentinel)
+                    output = buf[:idx]
+                    end = idx + len(sentinel)
+                    tail = buf[end:]
+                    return output, False, tail
+            except (OSError, select.error):
+                break
+        return buf, True, b""
+
+    def run(self, command: str, cwd: str = "", timeout: float = 120.0,
+            output_offset: int = 0) -> dict:
+        """在常驻会话中执行命令。
+
+        output_offset: 从之前输出的第 N 字节开始返回(续读), N=0 表示从头。
+        """
+        if self.master_fd is None or not self._alive():
+            self.close()
+            self._start()
+
+        with self.lock:
+            self.last_used = time.time()
+
+            nonce = f"{int(time.time()*1000):x}{random.randint(0,0xffff):04x}"
+            # 完整结束标记: __RK_<nonce>_<exitcode>__
+            end_re = re.compile(rb"__RK_" + re.escape(nonce.encode()) + rb"_(-?\d+)__")
+
+            # 组装命令: 可选 cd + base64 eval + 哨兵 printf
+            parts = []
+            if cwd:
+                cwd_p = str(check_path(cwd))
+                parts.append(f"cd {shlex.quote(cwd_p)} 2>/dev/null || true")
+            b64 = base64.b64encode(command.encode()).decode()
+            parts.append(f'eval "$(echo {b64} | base64 -d)"')
+            parts.append('__rk=$?')
+            parts.append(f'printf "\\n__RK_{nonce}_%d__\\n" "$__rk"')
+            wrapped = "; ".join(parts)
+
+            try:
+                os.write(self.master_fd, (wrapped + "\n").encode())
+            except OSError as e:
+                return {"exit_code": -1, "stdout": "", "stderr": f"会话写入失败: {e}",
+                        "timed_out": False}
+
+            output, timed_out, tail = self._read_until(
+                f"__RK_{nonce}_".encode(), timeout=timeout)
+
+            if timed_out:
+                try:
+                    os.write(self.master_fd, b"\x03")
+                except OSError:
+                    pass
+                time.sleep(0.2)
+                more, _, _ = self._read_until(
+                    f"__RK_{nonce}_".encode(), timeout=3.0)
+                output += more
+                text = decode_bytes(output)
+                return {
+                    "exit_code": -1,
+                    "stdout": clip(text[output_offset:], SESSION_OUTPUT_MAX),
+                    "stderr": "",
+                    "timed_out": True,
+                    "output_total_bytes": len(text),
+                    "output_offset": output_offset,
+                    "still_running": True,
+                    "hint": "命令超时已发 Ctrl-C; 用 output_offset 续读输出",
+                }
+
+            # 从 tail + 可能的后续字节解析 exit code
+            exit_code = -1
+            m = end_re.search(tail)
+            if not m:
+                # tail 不够, 再读一点
+                try:
+                    extra = os.read(self.master_fd, 64)
+                    tail += extra
+                    m = end_re.search(tail)
+                except OSError:
+                    pass
+            if m:
+                exit_code = int(m.group(1))
+
+            self.last_used = time.time()
+            text = decode_bytes(output)
+            return {
+                "exit_code": exit_code,
+                "stdout": clip(text[output_offset:], SESSION_OUTPUT_MAX),
+                "stderr": "",
+                "timed_out": False,
+                "output_total_bytes": len(text),
+                "output_offset": output_offset,
+            }
+
+    def interrupt(self) -> dict:
+        """发送 Ctrl-C 中断当前命令。"""
+        if self.master_fd is None:
+            return {"ok": False, "error": "会话未启动"}
+        try:
+            os.write(self.master_fd, b"\x03")
+            return {"ok": True, "msg": "已发送 Ctrl-C"}
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+
+    def _alive(self) -> bool:
+        if self.pid is None:
+            return False
+        try:
+            os.kill(self.pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def close(self) -> None:
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+        if self.pid is not None:
+            try:
+                os.killpg(os.getpgid(self.pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                try:
+                    os.kill(self.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            self.pid = None
+
+    def is_idle(self) -> bool:
+        return time.time() - self.last_used > SESSION_IDLE_TIMEOUT
+
+    def is_expired(self) -> bool:
+        return time.time() - self.created > SESSION_MAX_LIFETIME
+
+
+# 全局会话池: key = "default" (proot) / "native" 或自定义 session_id
+_SESSIONS: dict[str, ShellSession] = {}
+_SESSIONS_LOCK = threading.Lock()
+# 后台任务注册表
+_BG_TASKS: dict[str, dict] = {}
+_BG_TASKS_LOCK = threading.Lock()
+BG_LOG_DIR = WORKSPACE_ROOT / ".mcp-bg-logs"
+try:
+    BG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    BG_LOG_DIR = Path("/tmp")
+
+
+def _get_session(session_id: str = "default", proot: bool = True,
+                 cwd: str = "") -> ShellSession:
+    with _SESSIONS_LOCK:
+        sess = _SESSIONS.get(session_id)
+        if sess is None or not sess._alive():
+            if sess:
+                sess.close()
+            sess = ShellSession(proot=proot, cwd=cwd)
+            _SESSIONS[session_id] = sess
+        return sess
+
+
+def _reap_sessions() -> None:
+    """回收空闲/过期会话(调用方持锁)。"""
+    dead = [k for k, s in _SESSIONS.items() if s.is_idle() or s.is_expired() or not s._alive()]
+    for k in dead:
+        _SESSIONS[k].close()
+        del _SESSIONS[k]
+
+
+def session_cleanup_thread() -> None:
+    while True:
+        time.sleep(120)
+        try:
+            with _SESSIONS_LOCK:
+                _reap_sessions()
+        except Exception:
+            pass
+
+
+# ============================================================
+# 后台任务
+# ============================================================
+
+def tool_start_background(command: str, cwd: str = "",
+                          proot: Optional[bool] = None,
+                          task_name: str = "") -> dict:
+    """启动后台任务(detached), 输出落盘, 不阻塞。"""
+    assert_shell_command_allowed(command)
+    tid = uuid.uuid4().hex[:12]
+    name = task_name or f"bg-{tid[:8]}"
+    log_path = BG_LOG_DIR / f"{tid}.log"
+    shell_bin = os.environ.get("SHELL") or f"{PREFIX}/bin/bash"
+    if not os.path.exists(shell_bin):
+        shell_bin = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    cwd_p = str(check_path(cwd)) if cwd else str(WORKSPACE_ROOT)
+    want_proot = USE_PROOT if proot is None else bool(proot)
+    if want_proot and os.path.exists(_proot_bin):
+        try:
+            rel = Path(cwd_p).resolve().relative_to(WORKSPACE_ROOT.resolve())
+            inner = "/workspace" + ("/" + rel.as_posix() if rel.as_posix() != "." else "")
+        except (ValueError, OSError):
+            inner = cwd_p
+        argv = _proot_argv(shell_bin, command, inner)
+        popen_cwd = None
+    else:
+        argv = [shell_bin, "-c", command]
+        popen_cwd = cwd_p
+
+    log_fh = open(log_path, "wb")
+    try:
+        proc = subprocess.Popen(
+            argv, cwd=popen_cwd, stdout=log_fh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+    except Exception as e:
+        log_fh.close()
+        return {"ok": False, "error": str(e)}
+
+    task = {
+        "id": tid, "name": name, "pid": proc.pid, "command": command,
+        "cwd": cwd_p, "log_path": str(log_path), "proot": want_proot,
+        "started": time.time(), "finished": None, "exit_code": None,
+    }
+    with _BG_TASKS_LOCK:
+        _BG_TASKS[tid] = task
+
+    def _waiter():
+        proc.wait()
+        with _BG_TASKS_LOCK:
+            if tid in _BG_TASKS:
+                _BG_TASKS[tid]["finished"] = time.time()
+                _BG_TASKS[tid]["exit_code"] = proc.returncode
+        try:
+            log_fh.close()
+        except Exception:
+            pass
+    threading.Thread(target=_waiter, daemon=True).start()
+
+    return {"ok": True, "task_id": tid, "name": name, "pid": proc.pid,
+            "log_path": str(log_path)}
+
+
+def tool_list_background() -> dict:
+    """列出后台任务及状态。"""
+    with _BG_TASKS_LOCK:
+        # 顺手回收老任务
+        now = time.time()
+        stale = []
+        for tid, t in _BG_TASKS.items():
+            if t["finished"] and now - t["finished"] > BG_TASK_IDLE_RECYCLE:
+                stale.append(tid)
+            elif now - t["started"] > BG_TASK_MAX_LIFETIME:
+                stale.append(tid)
+        for tid in stale:
+            del _BG_TASKS[tid]
+        tasks = list(_BG_TASKS.values())
+
+    out = []
+    for t in tasks:
+        running = t["finished"] is None
+        out.append({
+            "id": t["id"], "name": t["name"], "pid": t["pid"],
+            "command": t["command"][:200],
+            "running": running,
+            "exit_code": t["exit_code"],
+            "running_for_sec": round(now - t["started"], 1) if running else None,
+            "finished_sec_ago": round(now - t["finished"], 1) if t["finished"] else None,
+        })
+    return {"count": len(out), "tasks": out}
+
+
+def tool_read_background(task_id: str, tail_bytes: int = 8192,
+                         offset: int = 0) -> dict:
+    """读后台任务日志。默认读最后 8KB; offset>0 从指定字节读。"""
+    with _BG_TASKS_LOCK:
+        t = _BG_TASKS.get(task_id)
+    if not t:
+        return {"ok": False, "error": f"未知任务: {task_id}"}
+    lp = Path(t["log_path"])
+    if not lp.exists():
+        return {"ok": True, "task_id": task_id, "text": "", "total_bytes": 0}
+    total = lp.stat().st_size
+    if offset > 0:
+        start = min(offset, total)
+    elif tail_bytes > 0:
+        start = max(0, total - tail_bytes)
+    else:
+        start = 0
+    with open(lp, "rb") as f:
+        f.seek(start)
+        data = f.read(min(BG_TASK_MAX_OUTPUT - start, 65536))
+    return {
+        "ok": True, "task_id": task_id, "running": t["finished"] is None,
+        "exit_code": t["exit_code"],
+        "text": clip(decode_bytes(data), BG_TASK_MAX_OUTPUT),
+        "total_bytes": total, "read_from": start, "read_bytes": len(data),
+    }
+
+
+def tool_kill_background(task_id: str) -> dict:
+    """终止后台任务。"""
+    with _BG_TASKS_LOCK:
+        t = _BG_TASKS.get(task_id)
+    if not t:
+        return {"ok": False, "error": f"未知任务: {task_id}"}
+    if t["finished"] is not None:
+        return {"ok": True, "msg": "任务已结束", "exit_code": t["exit_code"]}
+    try:
+        os.killpg(os.getpgid(t["pid"]), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        try:
+            os.kill(t["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(1)
+    # 强杀
+    try:
+        os.killpg(os.getpgid(t["pid"]), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+    return {"ok": True, "msg": "已发送 SIGTERM + SIGKILL"}
+
+
 # ============================================================
 
 def _run_shell(command: str, cwd: str = "", timeout: int = 120,
@@ -203,8 +675,31 @@ def _run_shell(command: str, cwd: str = "", timeout: int = 120,
 
 
 def tool_shell(command: str, cwd: str = "", timeout: int = 120,
-               proot: Optional[bool] = None) -> dict:
-    """在 Termux/Linux 上执行 bash/sh 命令。默认跑在 proot 全权限沙箱(uid=0, / 可写)。"""
+               proot: Optional[bool] = None, use_session: bool = True,
+               session_id: str = "default", output_offset: int = 0,
+               interrupt: bool = False) -> dict:
+    """在 Termux/Linux 上执行 bash/sh 命令。
+
+    默认使用常驻 pty 会话(免 proot 冷启动, 支持 cd/export 状态保持)。
+    use_session=false 回退到一次性 subprocess(适合跑了就走的命令)。
+    output_offset: 续读上次超时/截断的输出。
+    interrupt: 向会话发送 Ctrl-C。
+    """
+    assert_shell_command_allowed(command)
+    want_proot = USE_PROOT if proot is None else bool(proot)
+    if interrupt:
+        sess = _get_session(session_id, proot=want_proot)
+        return sess.interrupt()
+    if use_session:
+        try:
+            sess = _get_session(session_id, proot=want_proot)
+            result = sess.run(command, cwd=cwd, timeout=min(timeout, 600),
+                              output_offset=output_offset)
+            result["session_id"] = session_id
+            return result
+        except Exception as e:
+            # 会话挂了就回退一次性执行
+            pass
     return _run_shell(command, cwd, timeout, proot)
 
 
@@ -678,14 +1173,18 @@ def tool_codex_patch(patch: str, cwd: str = "", dry_run: bool = False,
 TOOLS: list[dict] = [
     {
         "name": "shell",
-        "description": "在 Termux / Android 上执行 bash 命令。默认跑在 proot 全权限沙箱(uid=0, / 可写, 宿主 ~/workspace 映射为 /workspace)。proot=false 可回到原生 Termux 环境。",
+        "description": "在 Termux / Android 上执行 bash 命令。默认用常驻 pty 会话(免冷启动, cd/export 状态保持)。proot=false 可回到原生 Termux。超时后仍在跑的命令可用 output_offset 续读输出。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "要执行的 Shell 命令"},
                 "cwd": {"type": "string", "description": "工作目录(可选), 相对路径基于 /workspace"},
-                "timeout": {"type": "integer", "description": "超时秒数, 默认 120", "default": 120},
+                "timeout": {"type": "integer", "description": "超时秒数, 默认 120, 最大 600", "default": 120},
                 "proot": {"type": "boolean", "description": "是否用 proot 全权限沙箱, 默认 true"},
+                "use_session": {"type": "boolean", "description": "使用常驻会话(默认 true), false 则一次性 subprocess", "default": True},
+                "session_id": {"type": "string", "description": "会话标识, 默认 'default'。不同 id 互不干扰", "default": "default"},
+                "output_offset": {"type": "integer", "description": "从输出第 N 字节续读(用于上次超时/截断)", "default": 0},
+                "interrupt": {"type": "boolean", "description": "向会话发送 Ctrl-C 中断当前命令", "default": False},
             },
             "required": ["command"],
         },
@@ -809,6 +1308,47 @@ TOOLS: list[dict] = [
             "required": ["patch"],
         },
     },
+    {
+        "name": "start_background",
+        "description": "启动后台任务(detached, 不阻塞), 输出落盘。返回 task_id, 用 read_background 读日志。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要后台执行的命令"},
+                "cwd": {"type": "string", "description": "工作目录(可选)"},
+                "proot": {"type": "boolean", "description": "是否用 proot 沙箱, 默认 true"},
+                "task_name": {"type": "string", "description": "任务别名(可选)"},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "list_background",
+        "description": "列出所有后台任务及其运行状态/退出码。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_background",
+        "description": "读后台任务输出日志。默认读最后 8KB; offset>0 从指定字节开始读。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "tail_bytes": {"type": "integer", "default": 8192},
+                "offset": {"type": "integer", "default": 0},
+            },
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "kill_background",
+        "description": "终止指定后台任务(SIGTERM + SIGKILL)。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        },
+    },
 ]
 
 _TOOL_IMPL = {
@@ -820,6 +1360,10 @@ _TOOL_IMPL = {
     "open_path": tool_open_path,
     "grep": tool_grep,
     "codex_patch": tool_codex_patch,
+    "start_background": tool_start_background,
+    "list_background": tool_list_background,
+    "read_background": tool_read_background,
+    "kill_background": tool_kill_background,
 }
 
 _GREP_ARG_ALIAS = {"-A": "after", "-B": "before", "-C": "context"}
@@ -1016,6 +1560,10 @@ def main() -> None:
     PORT = args.port
     AUTH_TOKEN = args.token
 
+    # 启动会话回收线程
+    threading.Thread(target=session_cleanup_thread, daemon=True,
+                     name="session-cleanup").start()
+
     server = ThreadingHTTPServer((HOST, PORT), MCPHandler)
     log(f"============================================================")
     log(f" Termux MCP Server v{VERSION} 启动完成")
@@ -1030,6 +1578,12 @@ def main() -> None:
     except KeyboardInterrupt:
         log("Server 正在停止...")
         server.shutdown()
+    finally:
+        # 关闭所有常驻会话
+        with _SESSIONS_LOCK:
+            for s in _SESSIONS.values():
+                s.close()
+            _SESSIONS.clear()
 
 
 if __name__ == "__main__":
