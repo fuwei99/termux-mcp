@@ -26,18 +26,20 @@ bash start.sh
 
 ---
 
-## 🛠️ 工具清单 (8 个能力)
+## 🛠️ 工具清单 (mcp 9 个 + 母节点 devices = 10)
 
-1. **`shell`**：执行 bash/sh 命令行指令，带超时、工作目录切换与自动截断。
-2. **`read_file`**：读取任意文本文件（自动兼容各种编码）。
-3. **`write_file`**：写入文本文件，自动创建父级目录。
-4. **`edit_file`**：精确查找并替换文件内容（支持单次与批量 edits）。
-5. **`grep`**：ripgrep 极速代码/文本搜索（支持正则、文件类型过滤、上下文行）。
-6. **`codex_patch`**：OpenAI Codex file-style patch 解析与应用，带自动备份与失败自动回滚。
-7. **`termux_api`**：直接调用 Android 底层能力（toast 弹窗、剪贴板获取/设置、振动、通知、电池状态、WiFi 信息等）。
-8. **`open_path`**：调用 `termux-open` 打开 URL 或本地文件。
+1. **`shell`**：一次性执行 bash/sh 命令(subprocess, 跑完即销)。适合无状态命令。
+2. **`shell_session`**：常驻 pty bash 会话，cd/export/变量在同 session_id 间持久保持；哨兵协议，超时后 output_offset 续读，interrupt 发 Ctrl-C。
+3. **`read_file`**：读取任意文本文件（自动兼容各种编码）。
+4. **`write_file`**：写入文本文件，自动创建父级目录。
+5. **`edit_file`**：精确查找并替换文件内容（支持单次与批量 edits）。
+6. **`grep`**：ripgrep 极速代码/文本搜索（支持正则、文件类型过滤、上下文行）。
+7. **`codex_patch`**：OpenAI Codex file-style patch 解析与应用，带自动备份与失败自动回滚。
+8. **`termux_api`**：直接调用 Android 底层能力（toast 弹窗、剪贴板获取/设置、振动、通知、电池状态、WiFi 信息等）。
+9. **`open_path`**：调用 `termux-open` 打开 URL 或本地文件。
+10. **`devices`**（母节点 hub 层）：列出已接入设备及在线状态。
 
-> `ls` / `ps` / `uname` / `free` / `df` 等系统信息查询全部用 `shell` 工具直接跑命令，不再单独封装。
+> `ls` / `ps` / `uname` / `free` / `df` 等系统查询全部用 `shell` 直接跑命令。后台长任务用 `shell_session`（续读+still_running 覆盖）。
 
 ---
 

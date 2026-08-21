@@ -294,10 +294,21 @@ def node_rpc(node: str, method: str, params: Optional[dict] = None,
 # ============================================================
 
 _FALLBACK_TOOLS = [
-    ("shell", "在指定设备执行 bash/sh 命令", {
+    ("shell", "一次性执行 bash/sh 命令(subprocess, 跑完即销)", {
         "command": {"type": "string", "description": "要执行的命令"},
         "cwd": {"type": "string", "description": "工作目录(可选)"},
-        "timeout": {"type": "integer", "description": "超时秒数, 默认 120"}}, ["command"]),
+        "timeout": {"type": "integer", "description": "超时秒数, 默认 120"},
+        "proot": {"type": "boolean", "description": "是否用 proot 全权限沙箱, 默认 true"}},
+        ["command"]),
+    ("shell_session", "常驻 pty bash 会话: cd/export 状态持久, 哨兵协议, output_offset 续读", {
+        "command": {"type": "string", "description": "要执行的命令"},
+        "cwd": {"type": "string"},
+        "timeout": {"type": "integer"},
+        "proot": {"type": "boolean"},
+        "session_id": {"type": "string", "description": "会话标识, 默认 default"},
+        "output_offset": {"type": "integer", "description": "从第 N 字节续读"},
+        "interrupt": {"type": "boolean", "description": "发送 Ctrl-C"}},
+        ["command"]),
     ("read_file", "读取指定设备上的文本文件", {
         "path": {"type": "string"}, "offset": {"type": "integer"},
         "limit": {"type": "integer"}}, ["path"]),
