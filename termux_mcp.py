@@ -30,6 +30,7 @@ import base64
 import fcntl
 import json
 import os
+import pty
 import queue
 import random
 import re
