@@ -26,6 +26,7 @@ CFG_MCP_PORT=""
 CFG_HUB_PORT=""
 CFG_TOKEN=""
 CFG_NGROK_TOKEN=""
+CFG_NGROK_WEB_PORT=""
 if [ -n "$CFG_FILE" ]; then
     eval "$(python3 - "$CFG_FILE" <<'PYEOF'
 import json, re, sys, shlex
@@ -58,6 +59,7 @@ emit('CFG_MCP_PORT', p.get('mcp'))
 emit('CFG_HUB_PORT', p.get('hub'))
 emit('CFG_TOKEN', d.get('auth_token') or d.get('token'))
 emit('CFG_NGROK_TOKEN', d.get('ngrok-authtoken') or d.get('ngrok_authtoken'))
+emit('CFG_NGROK_WEB_PORT', d.get('ngrok-web-port'))
 PYEOF
 )"
     echo "[start.sh] 配置: $CFG_FILE  mode=$MODE"
@@ -68,6 +70,8 @@ fi
 PORT="${TERMUX_MCP_PORT:-${CFG_MCP_PORT:-8996}}"
 HUB_PORT="${TERMUX_HUB_PORT:-${CFG_HUB_PORT:-8994}}"
 TOKEN="${TERMUX_MCP_TOKEN:-${CFG_TOKEN:-wei123..}}"
+# ngrok 本地 web 面板端口: 默认 4045, 避开宿主 proot 守护器的 4040 (同机共享端口!)
+NG_WEB_PORT="${TERMUX_NGROK_WEB_PORT:-${CFG_NGROK_WEB_PORT:-4045}}"
 
 # 隧道暴露哪个端口, 由 mode 决定
 if [ "$MODE" = "root" ]; then
@@ -91,7 +95,8 @@ fi
 # 1. 检查并彻底停止旧进程
 pkill -9 -f "termux_mcp.py" >/dev/null 2>&1
 pkill -9 -f "hub.py" >/dev/null 2>&1
-pkill -9 -f "ngrok" >/dev/null 2>&1
+# 只杀自己管理的 ngrok (匹配 runtime 配置), 不碰宿主 proot 守护器的 ngrok
+pkill -9 -f "ngrok.runtime.yml" >/dev/null 2>&1
 sleep 1
 
 # 2. 启动 MCP Server (后台) —— 两种模式都要, 母节点自己也是一台设备
@@ -145,7 +150,7 @@ fi
 
 if [ -n "$NGROK_BIN" ]; then
     echo "[3/4] 启动 ngrok 隧道 -> :$TUNNEL_PORT  ($TUNNEL_HINT)"
-    pkill -9 -f "ngrok" >/dev/null 2>&1
+    pkill -9 -f "ngrok.runtime.yml" >/dev/null 2>&1
     sleep 0.5
 
     # 隧道配置: 有 config 的 ngrok-authtoken 就现生成一份 ngrok.runtime.yml,
@@ -165,7 +170,7 @@ if [ -n "$NGROK_BIN" ]; then
 version: "2"
 authtoken: $NG_TOKEN
 region: $NG_REGION
-web_addr: 127.0.0.1:4040
+web_addr: 127.0.0.1:$NG_WEB_PORT
 log: stdout
 log_level: info
 
@@ -183,7 +188,7 @@ EOF
         TUNNEL_URL=""
         for i in {1..10}; do
             sleep 1
-            TUNNEL_URL=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https://[^"]*"' | head -n 1 | cut -d '"' -f 4)
+            TUNNEL_URL=$(curl -s "http://127.0.0.1:$NG_WEB_PORT/api/tunnels" 2>/dev/null | grep -o '"public_url":"https://[^"]*"' | head -n 1 | cut -d '"' -f 4)
             [ -n "$TUNNEL_URL" ] && break
         done
 
