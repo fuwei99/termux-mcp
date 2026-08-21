@@ -304,9 +304,17 @@ _FALLBACK_TOOLS = [
     ("write_file", "向指定设备写入文本文件(utf-8), 自动建父目录", {
         "path": {"type": "string"}, "text": {"type": "string"},
         "overwrite": {"type": "boolean"}}, ["path", "text"]),
-    ("list_dir", "列出指定设备的目录内容与文件大小", {
-        "path": {"type": "string"}, "depth": {"type": "integer"}}, []),
-    ("system_info", "获取指定设备的系统信息(CPU/内存/磁盘/电池等)", {}, []),
+    ("edit_file", "文本精确替换(单次或批量)", {
+        "path": {"type": "string"}, "old_text": {"type": "string"},
+        "new_text": {"type": "string"}}, ["path"]),
+    ("grep", "搜索文件内容(ripgrep)", {
+        "query": {"type": "string"}, "path": {"type": "string"}}, ["query"]),
+    ("codex_patch", "应用 Codex file-style patch", {
+        "patch": {"type": "string"}}, ["patch"]),
+    ("termux_api", "调用 Termux:API 设备能力", {
+        "command": {"type": "string"}}, ["command"]),
+    ("open_path", "用 termux-open 打开文件/URL", {
+        "target": {"type": "string"}}, ["target"]),
 ]
 
 _tools_cache: dict[str, Any] = {"ts": 0.0, "tools": [], "src": ""}

@@ -26,19 +26,18 @@ bash start.sh
 
 ---
 
-## 🛠️ 工具清单 (11 个能力)
+## 🛠️ 工具清单 (8 个能力)
 
 1. **`shell`**：执行 bash/sh 命令行指令，带超时、工作目录切换与自动截断。
 2. **`read_file`**：读取任意文本文件（自动兼容各种编码）。
 3. **`write_file`**：写入文本文件，自动创建父级目录。
 4. **`edit_file`**：精确查找并替换文件内容（支持单次与批量 edits）。
-5. **`list_dir`**：列出目录结构与文件大小。
-6. **`list_processes`**：列出系统当前正在运行的进程 (top N)。
-7. **`system_info`**：查看系统架构、Linux 内核版本、内存占用 `free`、磁盘占用 `df`、电池电量等。
-8. **`grep`**：ripgrep 极速代码/文本搜索（支持正则、文件类型过滤、上下文行）。
-9. **`codex_patch`**：OpenAI Codex file-style patch 解析与应用，带自动备份与失败自动回滚。
-10. **`termux_api`**：直接调用 Android 底层能力（toast 弹窗、剪贴板获取/设置、振动、通知、电池状态、WiFi 信息等）。
-11. **`open_path`**：调用 `termux-open` 打开 URL 或本地文件。
+5. **`grep`**：ripgrep 极速代码/文本搜索（支持正则、文件类型过滤、上下文行）。
+6. **`codex_patch`**：OpenAI Codex file-style patch 解析与应用，带自动备份与失败自动回滚。
+7. **`termux_api`**：直接调用 Android 底层能力（toast 弹窗、剪贴板获取/设置、振动、通知、电池状态、WiFi 信息等）。
+8. **`open_path`**：调用 `termux-open` 打开 URL 或本地文件。
+
+> `ls` / `ps` / `uname` / `free` / `df` 等系统信息查询全部用 `shell` 工具直接跑命令，不再单独封装。
 
 ---
 

@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
 import queue
 import shutil
 import subprocess
@@ -313,111 +312,6 @@ def tool_edit_file(path: str, old_text: str = "", new_text: str = "",
     with open(p, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
     return {"path": str(p), "replacements": total, "bytes": p.stat().st_size}
-
-
-def tool_list_dir(path: str = ".", depth: int = 1) -> dict:
-    """列出目录树(深度限制, 默认 1)。"""
-    p = check_path(path)
-    if not p.is_dir():
-        raise ValueError(f"目录不存在: {path}")
-    items: list[dict] = []
-
-    def walk(d: Path, cur: int):
-        try:
-            entries = sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-        except OSError as e:
-            items.append({"path": str(d), "type": "error", "note": str(e)})
-            return
-        for e in entries:
-            try:
-                st = e.stat()
-                it: dict[str, Any] = {"path": str(e), "name": e.name}
-                if e.is_dir():
-                    it["type"] = "dir"
-                    it["size"] = None
-                    items.append(it)
-                    if cur < depth:
-                        walk(e, cur + 1)
-                else:
-                    it["type"] = "file"
-                    it["size"] = st.st_size
-                    items.append(it)
-            except OSError:
-                items.append({"path": str(e), "name": e.name, "type": "?", "size": None})
-    walk(p, 1)
-    return {"path": str(p), "count": len(items), "items": items}
-
-
-def tool_list_processes(top: int = 30) -> dict:
-    """列出系统进程(基于 ps aux 提取 top N)。"""
-    try:
-        r = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=10)
-        lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
-    except Exception as e:
-        return {"error": f"ps aux 失败: {e}"}
-    
-    if not lines:
-        return {"count": 0, "processes": []}
-    
-    header = lines[0]
-    procs: list[dict] = []
-    for ln in lines[1:]:
-        parts = ln.split(None, 10)
-        if len(parts) >= 11:
-            procs.append({
-                "user": parts[0],
-                "pid": parts[1],
-                "cpu": parts[2],
-                "mem": parts[3],
-                "vsz": parts[4],
-                "rss": parts[5],
-                "stat": parts[7],
-                "command": parts[10],
-            })
-        elif len(parts) >= 4:
-            procs.append({"pid": parts[1], "info": ln})
-            
-    return {"count": len(procs), "processes": procs[:max(1, top)]}
-
-
-def tool_system_info() -> dict:
-    """获取 Termux / Linux 系统信息(架构/内存/存储/电池等)。"""
-    info: dict[str, Any] = {
-        "system": platform.system(),
-        "release": platform.release(),
-        "version": platform.version(),
-        "machine": platform.machine(),
-        "node": platform.node(),
-        "user": os.environ.get("USER") or "termux",
-        "home": os.environ.get("HOME", ""),
-        "prefix": os.environ.get("PREFIX", "/data/data/com.termux/files/usr"),
-        "python": sys.version.split()[0],
-        "cwd": os.getcwd(),
-        "uptime_ts": time.time(),
-    }
-    
-    # 内存与存储
-    try:
-        mem = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
-        info["free_m"] = mem.stdout.strip()
-    except Exception:
-        pass
-        
-    try:
-        disk = subprocess.run(["df", "-h", "."], capture_output=True, text=True, timeout=5)
-        info["disk_h"] = disk.stdout.strip()
-    except Exception:
-        pass
-        
-    # Termux API 电池检测(若有)
-    if shutil.which("termux-battery-status"):
-        try:
-            bat = subprocess.run(["termux-battery-status"], capture_output=True, text=True, timeout=5)
-            info["battery"] = json.loads(bat.stdout)
-        except Exception:
-            pass
-
-    return info
 
 
 def tool_termux_api(command: str, args: Optional[list] = None) -> dict:
@@ -854,32 +748,6 @@ TOOLS: list[dict] = [
         },
     },
     {
-        "name": "list_dir",
-        "description": "列出目录内容与文件大小。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "default": "."},
-                "depth": {"type": "integer", "default": 1},
-            },
-        },
-    },
-    {
-        "name": "list_processes",
-        "description": "列出系统进程列表(top N)。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "top": {"type": "integer", "default": 30},
-            },
-        },
-    },
-    {
-        "name": "system_info",
-        "description": "获取系统信息(Termux环境/CPU/内存/磁盘/电池等)。",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
         "name": "termux_api",
         "description": "调用 Termux:API 设备能力 (如 toast, battery-status, clipboard-get, clipboard-set, notification, vibrate, wifi-connectioninfo, volume 等)。",
         "inputSchema": {
@@ -948,9 +816,6 @@ _TOOL_IMPL = {
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
-    "list_dir": tool_list_dir,
-    "list_processes": tool_list_processes,
-    "system_info": tool_system_info,
     "termux_api": tool_termux_api,
     "open_path": tool_open_path,
     "grep": tool_grep,
