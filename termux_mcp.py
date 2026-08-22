@@ -191,17 +191,33 @@ def assert_shell_command_allowed(command: str) -> None:
 
 
 # ============================================================
-# 常驻 bash 会话 (pty + base64 + nonce 哨兵)
+# 常驻 bash 会话 (pty + 持久环形缓冲 + 游标续读 + nonce 哨兵)
 # ============================================================
+#
+# 设计对齐 rikkahub 的 WorkspaceRepository / WorkspaceInteractiveSession:
+#   1. 后台 reader 线程持续把 pty 输出灌进【持久环形缓冲】, 输出不再随调用蒸发。
+#   2. cursor 是"绝对字节位置", 续读按 cursor 取增量; 缓冲裁剪时累计 dropped。
+#   3. 命令超时【不杀】, 保留 pending_nonce, 之后用 action=read 接着读。
+#   4. 只有 action=interrupt 才发 \x03; 发完必须续读哨兵(exit 130)清 pending,
+#      否则下一条 exec 会被误判为"仍在运行"。
+#   5. 有悬挂命令时拒绝新 exec, 提示改用 read / interrupt。
+#   6. 有悬挂命令时【不回收】会话, 免得长任务被 idle/lifetime 判死。
+
+SESSION_BUFFER_MAX = 4_000_000   # 每会话环形缓冲上限(字节)
+SENTINEL_CARRY = 128             # 跨次读携带的尾字节数, 防哨兵被切成两半
+
 
 class ShellSession:
     """一个常驻 bash 进程, 通过 pty 通信。
 
     命令用 base64 编码后 eval 执行, 避免引号/转义地狱;
     结尾 printf 一个 __RK_<nonce>_<exitcode>__ 哨兵, 读到即本次结束。
+    pty 保留 ISIG, 所以 \\x03 是【真 Ctrl-C】(投递给整个前台进程组),
+    连 `while true; do sleep 1; done` 这种 bash 自身循环也能停。
     """
 
-    def __init__(self, proot: bool = True, cwd: str = ""):
+    def __init__(self, proot: bool = True, cwd: str = "", session_id: str = "default"):
+        self.session_id = session_id
         self.proot = proot
         self.cwd = cwd
         self.master_fd: Optional[int] = None
@@ -209,7 +225,25 @@ class ShellSession:
         self.created = time.time()
         self.last_used = time.time()
         self.lock = threading.Lock()
+
+        # ---- 持久输出缓冲 ----
+        self._buf = bytearray()
+        self._buf_lock = threading.Lock()
+        self.dropped = 0            # 被裁掉的字节数(= buf[0] 的绝对位置)
+        self.cursor = 0             # 已消费到的绝对位置
+        self._carry = b""           # 上次返回过的尾巴, 仅用于哨兵跨读匹配
+        self._reader: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
+        self._eof = False
+
+        # ---- 悬挂命令状态 ----
+        self.pending_nonce: Optional[str] = None
+        self.pending_command: Optional[str] = None
+        self.pending_started: float = 0.0
+
         self._start()
+
+    # ---------------- 启动 / 停止 ----------------
 
     def _start(self) -> None:
         shell_bin = os.environ.get("SHELL") or f"{PREFIX}/bin/bash"
@@ -274,8 +308,14 @@ class ShellSession:
             self.master_fd = master
             self.pid = pid
 
-        # 等待 shell 就绪, 发送 init 命令
-        time.sleep(0.3)
+        # reader 线程必须先起来, 否则 init 的输出没人接
+        self._reader_stop.clear()
+        self._eof = False
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True,
+                                        name=f"sess-reader-{self.session_id}")
+        self._reader.start()
+
+        time.sleep(0.2)
         init = (
             "stty -echo -onlcr -ixon 2>/dev/null; "
             "bind 'set enable-bracketed-paste off' 2>/dev/null; "
@@ -286,149 +326,14 @@ class ShellSession:
             os.write(self.master_fd, (init + "\n").encode())
         except Exception:
             pass
-        # 读掉 init 输出
-        out, timed_out, _ = self._read_until(b"__RK_READY__", timeout=8.0)
-        if timed_out:
-            log(f"[session] init ready timeout, got {len(out)} bytes")
-
-    def _read_until_regex(self, pattern: "re.Pattern[bytes]",
-                          timeout: float = 120.0) -> tuple[bytes, bool, Optional["re.Match[bytes]"]]:
-        """读到正则匹配或超时。返回 (output, timed_out, match)。
-
-        output 是匹配位置之前的字节(不含匹配); match 为命中的正则对象。
-        """
-        if self.master_fd is None:
-            return b"", False, None
-        buf = b""
-        deadline = time.time() + timeout
-        # 只保留最近 256 字节做匹配搜索, 避免每次 regex 扫全量
-        while time.time() < deadline:
-            try:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                r, _, _ = select.select([self.master_fd], [], [],
-                                        min(remaining, 1.0))
-                if not r:
-                    continue
-                try:
-                    chunk = os.read(self.master_fd, 65536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                buf += chunk
-                m = pattern.search(buf)
-                if m:
-                    return buf[:m.start()], False, m
-                # 输出上限保护: 超过 2MB 还没结束就截断返回(防失控)
-                if len(buf) > 2 * 1024 * 1024:
-                    return buf, True, None
-            except (OSError, select.error):
-                break
-        return buf, True, None
-
-    def _read_until(self, sentinel: bytes, timeout: float = 120.0) -> tuple[bytes, bool, bytes]:
-        """兼容旧调用: 读到字面 sentinel, 返回 (before, timed_out, after)。"""
-        pat = re.compile(re.escape(sentinel))
-        out, timed_out, m = self._read_until_regex(pat, timeout=timeout)
-        if m:
-            after_start = m.end()
-            return out, False, b""  # tail 不再需要, 调用方应改用 regex 版
-        return out, timed_out, b""
-
-    def run(self, command: str, cwd: str = "", timeout: float = 120.0,
-            output_offset: int = 0) -> dict:
-        """在常驻会话中执行命令。
-
-        output_offset: 从之前输出的第 N 字节开始返回(续读), N=0 表示从头。
-        """
-        if self.master_fd is None or not self._alive():
-            self.close()
-            self._start()
-
-        with self.lock:
-            self.last_used = time.time()
-
-            nonce = f"{int(time.time()*1000):x}{random.randint(0,0xffff):04x}"
-            # 完整结束标记: __RK_<nonce>_<exitcode>__ (允许前后有 \r\n)
-            end_re = re.compile(rb"__RK_" + re.escape(nonce.encode()) + rb"_(-?\d+)__")
-
-            # 组装命令: 可选 cd + base64 eval + 哨兵 printf
-            parts = []
-            if cwd:
-                cwd_p = str(check_path(cwd))
-                parts.append(f"cd {shlex.quote(cwd_p)} 2>/dev/null || true")
-            b64 = base64.b64encode(command.encode()).decode()
-            parts.append(f'eval "$(echo {b64} | base64 -d)"')
-            parts.append('__rk=$?')
-            parts.append(f'printf "\\n__RK_{nonce}_%d__\\n" "$__rk"')
-            wrapped = "; ".join(parts)
-
-            try:
-                os.write(self.master_fd, (wrapped + "\n").encode())
-            except OSError as e:
-                return {"exit_code": -1, "stdout": "", "stderr": f"会话写入失败: {e}",
-                        "timed_out": False}
-
-            output, timed_out, match = self._read_until_regex(end_re, timeout=timeout)
-
-            if timed_out:
-                try:
-                    os.write(self.master_fd, b"\x03")
-                except OSError:
-                    pass
-                time.sleep(0.2)
-                more, _, m2 = self._read_until_regex(end_re, timeout=3.0)
-                output += more
-                if m2:
-                    # Ctrl-C 后命令还是输出了退出码
-                    pass
-                text = _strip_ansi(decode_bytes(output))
-                return {
-                    "exit_code": -1,
-                    "stdout": clip(text[output_offset:], SESSION_OUTPUT_MAX),
-                    "stderr": "",
-                    "timed_out": True,
-                    "output_total_bytes": len(text),
-                    "output_offset": output_offset,
-                    "still_running": True,
-                    "hint": "命令超时已发 Ctrl-C; 用 output_offset 续读输出",
-                }
-
-            exit_code = int(match.group(1)) if match else -1
-
-            self.last_used = time.time()
-            text = _strip_ansi(decode_bytes(output))
-            return {
-                "exit_code": exit_code,
-                "stdout": clip(text[output_offset:], SESSION_OUTPUT_MAX),
-                "stderr": "",
-                "timed_out": False,
-                "output_total_bytes": len(text),
-                "output_offset": output_offset,
-            }
-
-    def interrupt(self) -> dict:
-        """发送 Ctrl-C 中断当前命令。"""
-        if self.master_fd is None:
-            return {"ok": False, "error": "会话未启动"}
-        try:
-            os.write(self.master_fd, b"\x03")
-            return {"ok": True, "msg": "已发送 Ctrl-C"}
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
-
-    def _alive(self) -> bool:
-        if self.pid is None:
-            return False
-        try:
-            os.kill(self.pid, 0)
-            return True
-        except OSError:
-            return False
+        # 消费掉 init 输出, 把 cursor 推到 READY 之后
+        ready_re = re.compile(rb"__RK_READY__")
+        body, matched, _ = self._poll(ready_re, timeout=8.0, use_carry=False)
+        if not matched:
+            log(f"[session {self.session_id}] init ready timeout, got {len(body)} bytes")
 
     def close(self) -> None:
+        self._reader_stop.set()
         if self.master_fd is not None:
             try:
                 os.close(self.master_fd)
@@ -444,15 +349,308 @@ class ShellSession:
                 except OSError:
                     pass
             self.pid = None
+        self.pending_nonce = None
+        self.pending_command = None
+
+    def _alive(self) -> bool:
+        if self.pid is None:
+            return False
+        try:
+            os.kill(self.pid, 0)
+            return True
+        except OSError:
+            return False
+
+    # ---------------- 输出缓冲 ----------------
+
+    def _reader_loop(self) -> None:
+        """持续把 pty 输出灌进环形缓冲, 直到 EOF 或被关闭。"""
+        while not self._reader_stop.is_set():
+            fd = self.master_fd
+            if fd is None:
+                break
+            try:
+                r, _, _ = select.select([fd], [], [], 0.5)
+            except (OSError, ValueError, select.error):
+                break
+            if not r:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                self._eof = True
+                break
+            with self._buf_lock:
+                self._buf += chunk
+                if len(self._buf) > SESSION_BUFFER_MAX:
+                    cut = len(self._buf) - SESSION_BUFFER_MAX
+                    del self._buf[:cut]
+                    self.dropped += cut
+        self._eof = True
+
+    def _read_since(self, cursor: int) -> tuple[bytes, int, int]:
+        """取 cursor 之后的增量。返回 (数据, 新 cursor, 因裁剪跳过的字节数)。"""
+        with self._buf_lock:
+            base = self.dropped
+            skipped = 0
+            if cursor < base:
+                skipped = base - cursor
+                cursor = base
+            idx = cursor - base
+            data = bytes(self._buf[idx:])
+            new_cursor = base + len(self._buf)
+        return data, new_cursor, skipped
+
+    def _poll(self, pattern: "re.Pattern[bytes]", timeout: float,
+              use_carry: bool = True) -> tuple[bytes, Optional["re.Match[bytes]"], int]:
+        """轮询等 pattern 出现。
+
+        返回 (本次应输出的字节, match 或 None, 跳过字节数)。
+        命中 -> cursor 推到匹配之后, 清 carry;
+        超时 -> cursor 推到已读末尾, carry 留尾巴供下次跨读匹配(不重复输出)。
+        """
+        carry = self._carry if use_carry else b""
+        prefix = len(carry)
+        collected = bytearray(carry)
+        cursor = self.cursor
+        dropped_total = 0
+        deadline = time.time() + max(0.0, timeout)
+
+        while True:
+            data, cursor, skipped = self._read_since(cursor)
+            dropped_total += skipped
+            if data:
+                collected += data
+            m = pattern.search(collected)
+            if m:
+                self.cursor = cursor - (len(collected) - m.end())
+                self._carry = b""
+                return bytes(collected[prefix:m.start()]), m, dropped_total
+            if self._eof or not self._alive():
+                self.cursor = cursor
+                self._carry = b""
+                return bytes(collected[prefix:]), None, dropped_total
+            if time.time() >= deadline:
+                self.cursor = cursor
+                self._carry = bytes(collected[-SENTINEL_CARRY:]) if use_carry else b""
+                return bytes(collected[prefix:]), None, dropped_total
+            time.sleep(0.05)
+
+    def _decode(self, raw: bytes) -> str:
+        return _strip_ansi(decode_bytes(raw))
+
+    def _result(self, raw: bytes, exit_code: Optional[int], still: bool,
+                dropped: int, extra: Optional[dict] = None) -> dict:
+        text = self._decode(raw)
+        out: dict[str, Any] = {
+            "session_id": self.session_id,
+            "exit_code": exit_code if exit_code is not None else -1,
+            "stdout": clip(text, SESSION_OUTPUT_MAX),
+            "stderr": "",
+            "timed_out": still,
+            "still_running": still,
+            "cursor": self.cursor,
+        }
+        if dropped:
+            out["dropped_bytes"] = dropped
+            out["warning"] = f"缓冲溢出丢弃 {dropped} 字节(输出太快/太多), 长任务请用 action=bg_start"
+        if still:
+            out["pending_command"] = self.pending_command
+            out["elapsed_sec"] = round(time.time() - self.pending_started, 1)
+            out["hint"] = ("命令仍在运行(没被杀)。用 action=read 续读, "
+                           "action=interrupt 中断, action=close 强杀。")
+        return out
+
+    # ---------------- 动作 ----------------
+
+    def _respawn(self) -> None:
+        """会话 shell 死了(用户 exit / 进程崩) -> 原地重开一个干净的。"""
+        self.close()
+        with self._buf_lock:
+            self._buf = bytearray()
+            self.dropped = 0
+        self.cursor = 0
+        self._carry = b""
+        self.pending_nonce = None
+        self.pending_command = None
+        self.created = time.time()
+        self._start()
+
+    def exec_command(self, command: str, cwd: str = "", timeout: float = 120.0) -> dict:
+        """在会话内执行一条命令, 等哨兵直到 timeout。超时不杀命令。"""
+        respawned = False
+        if self.master_fd is None or not self._alive() or self._eof:
+            self._respawn()
+            respawned = True
+
+        with self.lock:
+            if self.pending_nonce is not None:
+                return {
+                    "session_id": self.session_id,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": (f"会话 {self.session_id} 还有命令在跑"
+                               + (f" (`{self.pending_command}`)" if self.pending_command else "")
+                               + "。用 action=read 续读, action=interrupt 中断, action=close 强杀。"),
+                    "timed_out": False,
+                    "still_running": True,
+                    "pending_command": self.pending_command,
+                    "elapsed_sec": round(time.time() - self.pending_started, 1),
+                }
+
+            self.last_used = time.time()
+            nonce = f"{int(time.time()*1000):x}{random.randint(0,0xffff):04x}"
+
+            parts = []
+            if cwd:
+                cwd_p = str(check_path(cwd))
+                parts.append(f"cd {shlex.quote(cwd_p)} 2>/dev/null || true")
+            b64 = base64.b64encode(command.encode()).decode()
+            parts.append(f'eval "$(echo {b64} | base64 -d)"')
+            parts.append('__rk=$?')
+            parts.append(f'printf "\\n__RK_{nonce}_%d__\\n" "$__rk"')
+            wrapped = "; ".join(parts)
+
+            self.pending_nonce = nonce
+            self.pending_command = command[:120]
+            self.pending_started = time.time()
+            self._carry = b""
+
+            try:
+                os.write(self.master_fd, (wrapped + "\n").encode())
+            except OSError as e:
+                self.pending_nonce = None
+                self.pending_command = None
+                return {"session_id": self.session_id, "exit_code": -1, "stdout": "",
+                        "stderr": f"会话写入失败: {e}", "timed_out": False,
+                        "still_running": False}
+
+            res = self._await_sentinel(timeout)
+            if respawned:
+                res["note"] = "会话之前已退出, 已自动重开(cd/变量等状态已丢失)"
+            return res
+
+    def _await_sentinel(self, timeout: float) -> dict:
+        """等当前悬挂命令的哨兵(调用方持锁)。"""
+        nonce = self.pending_nonce
+        if nonce is None:
+            data, cursor, skipped = self._read_since(self.cursor)
+            self.cursor = cursor
+            return self._result(data, None, False, skipped)
+
+        end_re = re.compile(rb"__RK_" + re.escape(nonce.encode()) + rb"_(-?\d+)__")
+        body, match, dropped = self._poll(end_re, timeout=timeout)
+        self.last_used = time.time()
+
+        if match is not None:
+            self.pending_nonce = None
+            self.pending_command = None
+            exit_code = int(match.group(1))
+            return self._result(body, exit_code, False, dropped)
+
+        if self._eof or not self._alive():
+            self.pending_nonce = None
+            self.pending_command = None
+            res = self._result(body, None, False, dropped)
+            res["stderr"] = ("会话 shell 已退出(命令里有 exit? 或进程被杀)。"
+                             "下次 exec 会自动重开新会话, 但 cd/变量状态会丢失。")
+            res["session_dead"] = True
+            return res
+
+        return self._result(body, None, True, dropped)
+
+    def read_output(self, timeout: float = 30.0) -> dict:
+        """续读: 有悬挂命令就等哨兵, 没有就只取增量(读 REPL 回显等)。"""
+        with self.lock:
+            self.last_used = time.time()
+            return self._await_sentinel(timeout)
+
+    def write_stdin(self, data: str) -> dict:
+        """裸写 stdin: 喂 REPL、答 y/n、输密码。不加换行, 自己带 \\n。"""
+        if self.master_fd is None:
+            return {"ok": False, "error": "会话未启动"}
+        try:
+            os.write(self.master_fd, data.encode())
+            self.last_used = time.time()
+            return {"ok": True, "session_id": self.session_id,
+                    "msg": f"已写入 {len(data)} 字符, 用 action=read 看回显"}
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+
+    def interrupt(self) -> dict:
+        """发送真 Ctrl-C 中断前台命令, 并续读哨兵清掉 pending。"""
+        if self.master_fd is None:
+            return {"ok": False, "error": "会话未启动"}
+        try:
+            os.write(self.master_fd, b"\x03")
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        # 给内核投递信号 + bash 收拾现场的时间
+        time.sleep(0.25)
+        with self.lock:
+            self.last_used = time.time()
+            if self.pending_nonce is None:
+                return {"ok": True, "session_id": self.session_id,
+                        "msg": "已发送 Ctrl-C(当时无悬挂命令)"}
+            # 命令被 SIGINT 杀死后, 非交互 bash 会【放弃整条命令列表】,
+            # 连尾巴上的 printf 哨兵一起丢掉 -> pending 永远清不掉。
+            # 对策: 补发一条探针哨兵。bash 只有在前台命令真结束后才会读下一行 stdin,
+            # 所以探针能回来 == 命令确实死了; 回不来 == 命令还在跑。
+            res = self._await_sentinel(1.5)
+            if self.pending_nonce is not None:
+                try:
+                    os.write(self.master_fd,
+                             f'printf "\\n__RK_{self.pending_nonce}_130__\\n"\n'.encode())
+                except OSError:
+                    pass
+                res2 = self._await_sentinel(2.0)
+                # 探针回来了: 把两段输出拼上, 别丢中断前的尾巴
+                if res.get("stdout") and res2.get("stdout"):
+                    res2["stdout"] = res["stdout"] + res2["stdout"]
+                elif res.get("stdout"):
+                    res2["stdout"] = res["stdout"]
+                res = res2
+            if self.pending_nonce is None:
+                res["msg"] = "interrupted (SIGINT via pty)"
+                res["exit_code"] = 130
+            else:
+                res["msg"] = "已发 SIGINT 但命令仍在跑, 用 action=close 强杀"
+            res["ok"] = True
+            return res
 
     def is_idle(self) -> bool:
+        # 有命令在跑就不算空闲, 别把长任务给回收了
+        if self.pending_nonce is not None:
+            return False
         return time.time() - self.last_used > SESSION_IDLE_TIMEOUT
 
     def is_expired(self) -> bool:
+        if self.pending_nonce is not None:
+            return False
         return time.time() - self.created > SESSION_MAX_LIFETIME
 
+    def info(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "alive": self._alive(),
+            "pid": self.pid,
+            "proot": self.proot,
+            "uses_pty": True,
+            "command_running": self.pending_nonce is not None,
+            "pending_command": self.pending_command,
+            "elapsed_sec": (round(time.time() - self.pending_started, 1)
+                            if self.pending_nonce else None),
+            "cursor": self.cursor,
+            "buffered_bytes": len(self._buf),
+            "dropped_bytes": self.dropped,
+            "idle_sec": round(time.time() - self.last_used, 1),
+            "age_sec": round(time.time() - self.created, 1),
+        }
 
-# 全局会话池: key = "default" (proot) / "native" 或自定义 session_id
+
+# 全局会话池: key = session_id
 _SESSIONS: dict[str, ShellSession] = {}
 _SESSIONS_LOCK = threading.Lock()
 # 后台任务注册表
@@ -472,14 +670,15 @@ def _get_session(session_id: str = "default", proot: bool = True,
         if sess is None or not sess._alive():
             if sess:
                 sess.close()
-            sess = ShellSession(proot=proot, cwd=cwd)
+            sess = ShellSession(proot=proot, cwd=cwd, session_id=session_id)
             _SESSIONS[session_id] = sess
         return sess
 
 
 def _reap_sessions() -> None:
-    """回收空闲/过期会话(调用方持锁)。"""
-    dead = [k for k, s in _SESSIONS.items() if s.is_idle() or s.is_expired() or not s._alive()]
+    """回收空闲/过期会话(调用方持锁)。有悬挂命令的会话不回收。"""
+    dead = [k for k, s in _SESSIONS.items()
+            if s.is_idle() or s.is_expired() or not s._alive()]
     for k in dead:
         _SESSIONS[k].close()
         del _SESSIONS[k]
@@ -493,8 +692,6 @@ def session_cleanup_thread() -> None:
                 _reap_sessions()
         except Exception:
             pass
-
-
 # ============================================================
 # 后台任务
 # ============================================================
@@ -564,30 +761,210 @@ def tool_shell(command: str, cwd: str = "", timeout: int = 120,
     return _run_shell(command, cwd, timeout, proot)
 
 
-def tool_shell_session(command: str, cwd: str = "", timeout: int = 120,
+def _bg_reap() -> None:
+    """清理已结束且超过保留期的后台任务(调用方持锁)。"""
+    now = time.time()
+    for tid, t in list(_BG_TASKS.items()):
+        proc = t.get("proc")
+        done = proc is None or proc.poll() is not None
+        if done and t.get("ended") and now - t["ended"] > BG_TASK_IDLE_RECYCLE:
+            _BG_TASKS.pop(tid, None)
+        elif not done and now - t["started"] > BG_TASK_MAX_LIFETIME:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+
+
+def _bg_status(t: dict) -> dict:
+    proc = t.get("proc")
+    rc = proc.poll() if proc is not None else None
+    if rc is not None and not t.get("ended"):
+        t["ended"] = time.time()
+    log_path = Path(t["log"])
+    return {
+        "task_id": t["tid"],
+        "command": t["command"],
+        "running": rc is None,
+        "exit_code": rc,
+        "pid": proc.pid if proc is not None else None,
+        "log": str(log_path),
+        "log_bytes": log_path.stat().st_size if log_path.exists() else 0,
+        "started_at": datetime.fromtimestamp(t["started"]).strftime("%Y-%m-%d %H:%M:%S"),
+        "elapsed_sec": round((t.get("ended") or time.time()) - t["started"], 1),
+    }
+
+
+def _bg_start(command: str, cwd: str = "", proot: Optional[bool] = None) -> dict:
+    """detach 一个后台任务, 输出落盘到日志文件。真正的长任务走这条路。"""
+    assert_shell_command_allowed(command)
+    with _BG_TASKS_LOCK:
+        _bg_reap()
+        running = [t for t in _BG_TASKS.values()
+                   if t.get("proc") is not None and t["proc"].poll() is None]
+        if len(running) >= 8:
+            return {"ok": False, "error": f"后台任务已达上限 8, 先 bg_kill 或等结束"}
+
+    shell_bin = os.environ.get("SHELL") or f"{PREFIX}/bin/bash"
+    if not os.path.exists(shell_bin):
+        shell_bin = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+
+    cwd_p = str(check_path(cwd)) if cwd else None
+    want_proot = USE_PROOT if proot is None else bool(proot)
+    if want_proot and os.path.exists(_proot_bin):
+        inner = cwd_p or str(WORKSPACE_ROOT)
+        try:
+            rel = Path(inner).resolve().relative_to(WORKSPACE_ROOT.resolve())
+            inner = "/workspace" + ("/" + rel.as_posix() if rel.as_posix() != "." else "")
+        except (ValueError, OSError):
+            pass
+        argv = _proot_argv(shell_bin, command, inner)
+        popen_cwd = None
+    else:
+        argv = [shell_bin, "-c", command]
+        popen_cwd = cwd_p
+
+    tid = f"bg-{uuid.uuid4().hex[:8]}"
+    log_path = BG_LOG_DIR / f"{tid}.log"
+    try:
+        fh = open(log_path, "wb")
+        proc = subprocess.Popen(argv, cwd=popen_cwd, stdin=subprocess.DEVNULL,
+                                stdout=fh, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except Exception as e:
+        return {"ok": False, "error": f"启动失败: {e}"}
+
+    t = {"tid": tid, "proc": proc, "command": command[:200],
+         "log": str(log_path), "started": time.time(), "ended": None, "fh": fh}
+    with _BG_TASKS_LOCK:
+        _BG_TASKS[tid] = t
+    res = _bg_status(t)
+    res["ok"] = True
+    res["hint"] = f"用 action=bg_read + task_id={tid} 看输出, action=bg_kill 杀掉"
+    return res
+
+
+def _bg_read(task_id: str, offset: int = 0) -> dict:
+    with _BG_TASKS_LOCK:
+        t = _BG_TASKS.get(task_id)
+    if t is None:
+        return {"ok": False, "error": f"无此任务: {task_id}", "tasks": _bg_list()["tasks"]}
+    res = _bg_status(t)
+    log_path = Path(t["log"])
+    text = ""
+    if log_path.exists():
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(max(0, offset))
+                text = _strip_ansi(decode_bytes(f.read()))
+        except OSError as e:
+            res["error"] = str(e)
+    res["ok"] = True
+    res["offset"] = offset
+    res["stdout"] = clip(text, SESSION_OUTPUT_MAX)
+    res["next_offset"] = res["log_bytes"]
+    return res
+
+
+def _bg_kill(task_id: str) -> dict:
+    with _BG_TASKS_LOCK:
+        t = _BG_TASKS.get(task_id)
+    if t is None:
+        return {"ok": False, "error": f"无此任务: {task_id}"}
+    proc = t.get("proc")
+    if proc is None or proc.poll() is not None:
+        return {"ok": True, "msg": "任务已结束", **_bg_status(t)}
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        time.sleep(0.3)
+        if proc.poll() is None:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception as e:
+        return {"ok": False, "error": f"杀进程失败: {e}"}
+    t["ended"] = time.time()
+    return {"ok": True, "msg": "已终止", **_bg_status(t)}
+
+
+def _bg_list() -> dict:
+    with _BG_TASKS_LOCK:
+        _bg_reap()
+        return {"ok": True, "tasks": [_bg_status(t) for t in _BG_TASKS.values()]}
+
+
+def tool_shell_session(command: str = "", cwd: str = "", timeout: int = 120,
                        proot: Optional[bool] = None,
                        session_id: str = "default",
+                       action: str = "",
+                       data: str = "",
+                       task_id: str = "",
+                       offset: int = 0,
                        output_offset: int = 0,
                        interrupt: bool = False) -> dict:
-    """常驻 pty bash 会话。cd/export/变量在同 session_id 间持久保持。
+    """常驻 pty bash 会话 + 后台任务。cd/export/变量在同 session_id 间持久保持。
 
     命令用 base64+nonce 哨兵协议包裹执行, 读到哨兵即返回。
-    超时后命令仍可能在跑, 用 output_offset 续读输出, 或 interrupt=true 发 Ctrl-C。
+    **超时不杀命令**: 返回 still_running=true, 之后用 action=read 续读。
+    真正的长任务(几分钟以上)用 action=bg_start, 输出落盘, 随时 bg_read。
     """
     want_proot = USE_PROOT if proot is None else bool(proot)
-    if interrupt:
-        sess = _get_session(session_id, proot=want_proot)
-        return sess.interrupt()
-    assert_shell_command_allowed(command)
+    act = (action or "").strip().lower()
+
+    # 兼容老调用: interrupt=true 等价 action=interrupt
+    if interrupt and not act:
+        act = "interrupt"
+    if not act:
+        act = "exec" if command else "read"
+
     try:
-        sess = _get_session(session_id, proot=want_proot)
-        result = sess.run(command, cwd=cwd, timeout=min(timeout, 600),
-                          output_offset=output_offset)
-        result["session_id"] = session_id
-        return result
+        # ---- 后台任务(不依赖会话) ----
+        if act in ("bg_start", "start"):
+            return _bg_start(command, cwd=cwd, proot=proot)
+        if act in ("bg_read", "task_read"):
+            return _bg_read(task_id, offset=offset or output_offset)
+        if act in ("bg_kill", "kill"):
+            return _bg_kill(task_id)
+        if act in ("bg_list", "tasks"):
+            return _bg_list()
+
+        # ---- 会话级 ----
+        if act == "list":
+            with _SESSIONS_LOCK:
+                return {"ok": True, "sessions": [s.info() for s in _SESSIONS.values()],
+                        "background_tasks": _bg_list()["tasks"]}
+        if act == "close":
+            with _SESSIONS_LOCK:
+                sess = _SESSIONS.pop(session_id, None)
+            if sess is None:
+                return {"ok": False, "error": f"无此会话: {session_id}"}
+            sess.close()
+            return {"ok": True, "msg": f"会话 {session_id} 已关闭(命令被强杀)"}
+
+        sess = _get_session(session_id, proot=want_proot, cwd=cwd)
+
+        if act == "info":
+            return {"ok": True, **sess.info()}
+        if act == "interrupt":
+            return sess.interrupt()
+        if act == "read":
+            return sess.read_output(timeout=min(max(timeout, 1), 600))
+        if act == "write":
+            if not data:
+                return {"ok": False, "error": "action=write 需要 data 参数(记得带 \\n)"}
+            return sess.write_stdin(data)
+        if act == "exec":
+            if not command:
+                return {"ok": False, "error": "action=exec 需要 command 参数"}
+            assert_shell_command_allowed(command)
+            return sess.exec_command(command, cwd=cwd,
+                                     timeout=min(max(timeout, 1), 600))
+
+        return {"ok": False, "error": f"未知 action: {action}",
+                "valid": ["exec", "read", "write", "interrupt", "close", "info",
+                          "list", "bg_start", "bg_read", "bg_kill", "bg_list"]}
     except Exception as e:
         return {"exit_code": -1, "stdout": "", "stderr": f"会话错误: {e}",
-                "timed_out": False, "hint": "可改用 shell 工具(一次性)"}
+                "timed_out": False, "still_running": False,
+                "hint": "可改用 shell 工具(一次性)"}
 
 
 def tool_read_file(path: str = "", offset: int = 0, limit: int = 65536,
@@ -1182,19 +1559,34 @@ TOOLS: list[dict] = [
     },
     {
         "name": "shell_session",
-        "description": "常驻 pty bash 会话: cd/export/shell 变量在同 session_id 间持久保持。命令以 base64+nonce 哨兵执行, 超时后用 output_offset 续读, interrupt 发 Ctrl-C。后台长任务由续读+still_running 覆盖。",
+        "description": (
+            "常驻 pty bash 会话 + 后台长任务。cd/export/变量在同 session_id 间持久保持。\n"
+            "**超时不杀命令**: 返回 still_running=true, 用 action=read 接着读输出(持久缓冲+游标, 不丢)。\n"
+            "action: exec(默认, 跑命令) / read(续读) / write(喂 stdin, 答 y/n、REPL) / "
+            "interrupt(真 Ctrl-C) / close(强杀会话) / info / list / "
+            "bg_start(detach 长任务, 输出落盘) / bg_read / bg_kill / bg_list。\n"
+            "几分钟以上的长任务用 bg_start, 别用 exec 干等。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "要执行的 Shell 命令"},
+                "command": {"type": "string", "description": "要执行的 Shell 命令 (action=exec/bg_start)"},
+                "action": {
+                    "type": "string",
+                    "description": "动作, 默认 exec(给了 command)或 read(没给)",
+                    "enum": ["exec", "read", "write", "interrupt", "close", "info",
+                             "list", "bg_start", "bg_read", "bg_kill", "bg_list"],
+                },
                 "cwd": {"type": "string", "description": "工作目录(可选), 相对路径基于 /workspace"},
-                "timeout": {"type": "integer", "description": "超时秒数, 默认 120, 最大 600", "default": 120},
+                "timeout": {"type": "integer", "description": "等哨兵的秒数, 默认 120, 最大 600。超时只是返回部分输出, 命令继续跑", "default": 120},
                 "proot": {"type": "boolean", "description": "是否用 proot 全权限沙箱, 默认 true"},
                 "session_id": {"type": "string", "description": "会话标识, 默认 'default'。不同 id 互不干扰", "default": "default"},
-                "output_offset": {"type": "integer", "description": "从输出第 N 字节续读(超时/截断后续读)", "default": 0},
-                "interrupt": {"type": "boolean", "description": "向会话发送 Ctrl-C 中断当前命令", "default": False},
+                "data": {"type": "string", "description": "action=write 时写入 stdin 的原文, 记得自带 \\n"},
+                "task_id": {"type": "string", "description": "action=bg_read/bg_kill 的后台任务 id"},
+                "offset": {"type": "integer", "description": "action=bg_read 时从日志第 N 字节开始读", "default": 0},
+                "interrupt": {"type": "boolean", "description": "[兼容旧参数] 等价于 action=interrupt", "default": False},
             },
-            "required": ["command"],
+            "required": [],
         },
     },
     {
