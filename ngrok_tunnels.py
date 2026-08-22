@@ -287,6 +287,29 @@ def on_sig(sig, _f):
     log(f"收到信号 {sig}, 退出中...")
 
 
+def fix_dns() -> None:
+    """Termux 默认 resolv.conf 首个 nameserver 是 ::1(本机无 DNS 服务),
+    Go/ngrok 解析域名会死等 [::1]:53 → connection refused → 隧道建不起来。
+    守护器启动时自检自修, 写成国内可达 DNS 优先。"""
+    prefix = os.environ.get("PREFIX", "")
+    if not prefix:
+        return
+    etc = Path(prefix) / "etc"
+    if not etc.is_dir():
+        return
+    rc = etc / "resolv.conf"
+    try:
+        need = True
+        if rc.is_file() and rc.stat().st_size:
+            txt = rc.read_text(encoding="utf-8", errors="replace")
+            need = (not txt.strip()) or bool(re.search(r"::1|^nameserver 1\.1\.1\.1", txt, re.M))
+        if need:
+            rc.write_text("nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 8.8.8.8\noptions timeout:1 attempts:2\n")
+            log("✅ 已修复 Termux DNS: resolv.conf -> 223.5.5.5 / 119.29.29.29 / 8.8.8.8")
+    except OSError as e:
+        log(f"⚠️ 修复 DNS 失败: {e}")
+
+
 def already_running() -> bool:
     """防双开: 检测是否已有本守护器实例在跑(排除自己)。"""
     try:
@@ -314,6 +337,8 @@ def main() -> int:
     if already_running():
         log("✗ 已有实例在跑, 退出 (防双开)")
         return 0
+
+    fix_dns()
 
     try:
         _st, tunnels, device = load()
