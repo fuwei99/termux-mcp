@@ -12,6 +12,15 @@
   //             Rikkahub 只连它一个端点, 由它按 device 参数转发到下面 nodes。
   "mode": "root",
 
+  // ── 功能开关 (可选, 默认都开, 兼容老配置) ──────────────────
+  //   "ngrok": false       不起公网隧道, 只跑本地 MCP。
+  //                        适合由 Rikkahub 原生保活(scheduled_processes +
+  //                        ngrok_tunnels.py)代管隧道的节点 —— 避免双 ngrok 抢端口。
+  //   "supervisor": false  不安装 supervisor 保活。
+  //                        同样适合由 Rikkahub scheduled_processes 代管的节点。
+  "ngrok": true,
+  "supervisor": true,
+
   // ngrok 授权 token。留空则沿用仓库自带的 ngrok.yml。
   // ⚠️ 一个免费 token 同时只能在线一条隧道, 每台设备用各自的号。
   "ngrok-authtoken": "",

@@ -141,6 +141,16 @@ else
 fi
 
 # 4. ngrok 隧道 —— 暴露 $TUNNEL_PORT
+#    可配置关闭: config.jsonc 的 "ngrok": false 时只跑本地 MCP,
+#    适合由外部守护器(Rikkahub scheduled_processes / ngrok_tunnels.py)代管隧道的节点。
+NGROK_ON="$(echo "${CFG_ENABLE_NGROK:-true}" | tr 'A-Z' 'a-z')"
+if [ "$NGROK_ON" = "false" ]; then
+    echo "[3/4] ⚙️ 已按配置跳过 ngrok (config.jsonc \"ngrok\": false)"
+    echo "[4/4] 本机端点: http://127.0.0.1:$TUNNEL_PORT/sse"
+    echo ""
+    echo "🚀 本地模式运行中(无公网隧道)! 日志: tail -f logs/mcp.log"
+    exit 0
+fi
 NGROK_BIN=""
 if command -v ngrok >/dev/null 2>&1; then
     NGROK_BIN="ngrok"

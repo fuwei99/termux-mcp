@@ -15,6 +15,12 @@ mkdir -p logs
 chmod +x *.sh 2>/dev/null
 eval "$(python3 read-config.py 2>/dev/null)"
 MODE="${MODE:-child}"
+SUP_ON="$(echo "${CFG_ENABLE_SUPERVISOR:-true}" | tr 'A-Z' 'a-z')"
+if [ "$SUP_ON" != "true" ]; then
+    echo "=== [0/4] ⚙️ config.jsonc 的 \"supervisor\": false, 跳过保活安装 ==="
+    echo "      (该节点由外部守护器如 Rikkahub scheduled_processes 代管, 不需要 supervisor)"
+    exit 0
+fi
 echo "=== [1/4] 当前 mode=$MODE ==="
 
 # ── 生成 processes.jsonc ────────────────────────────────────
@@ -62,6 +68,23 @@ open(p, 'w', encoding='utf-8').write(t)
 print("      已迁移 ngrok 判活 port(4040) -> tunnel (端口在听但隧道掉线时也能发现)")
 PY
     fi
+fi
+
+# ── 按 ngrok 开关关掉 processes.jsonc 里的 ngrok 条目 ──────
+# config.jsonc "ngrok": false = 隧道由外部守护器管, supervisor 不碰它
+NGROK_ON="$(echo "${CFG_ENABLE_NGROK:-true}" | tr 'A-Z' 'a-z')"
+if [ "$NGROK_ON" != "true" ] && [ -f "$DIR/processes.jsonc" ] && grep -q '"id": *"ngrok"' "$DIR/processes.jsonc"; then
+    python3 - "$DIR/processes.jsonc" <<'PY'
+import re, sys
+p = sys.argv[1]
+t = open(p, encoding='utf-8').read()
+t2 = re.sub(r'("id":\s*"ngrok",.*?)"enabled":\s*true', r'\1"enabled": false', t, flags=re.S)
+if t2 != t:
+    open(p, 'w', encoding='utf-8').write(t2)
+    print("      ⚙️ config \"ngrok\": false -> processes.jsonc 里 ngrok 条目已关闭 (交给外部守护器)")
+else:
+    print("      ⚙️ config \"ngrok\": false (ngrok 条目已是关闭状态)")
+PY
 fi
 
 # ── Termux:Boot ─────────────────────────────────────────────
