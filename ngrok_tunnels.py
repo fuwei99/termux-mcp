@@ -132,6 +132,11 @@ class Tunnel:
             items = [self.basic_auth] if isinstance(self.basic_auth, str) else self.basic_auth
             for ba in items:
                 c += ["--basic-auth", ba]
+        # Termux 原生环境没有 /etc: Go(netgo resolver) 读不到 /etc/resolv.conf,
+        # 会 fallback 到 [::1]:53 死等 connection refused (隧道建不起来)。
+        # termux-chroot 把 $PREFIX/etc/resolv.conf 映射成 /etc/resolv.conf (install.sh 已装 proot)。
+        if shutil.which("termux-chroot"):
+            return ["termux-chroot"] + c
         return c
 
     def alive(self) -> bool:
