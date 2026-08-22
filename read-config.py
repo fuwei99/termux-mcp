@@ -74,6 +74,7 @@ def main() -> None:
     emit("CFG_HUB_PORT", ports.get("hub"))
     emit("CFG_TOKEN", data.get("auth_token") or data.get("token"))
     emit("CFG_NGROK_TOKEN", data.get("ngrok-authtoken") or data.get("ngrok_authtoken"))
+    emit("CFG_NGROK_WEB_PORT", data.get("ngrok-web-port"))
     # 功能开关 (可选, 默认都开, 兼容老配置):
     #   "ngrok": false       不起公网隧道, 只跑本地 MCP (外部守护器代管隧道时用)
     #   "supervisor": false  不装 supervisor 保活 (Rikkahub scheduled_processes 代管时用)

@@ -18,12 +18,15 @@ else
   TUNNEL_PORT="$PORT"
 fi
 
-# ngrok agent 可能"进程活着、4040 在听、但隧道已经掉了"(公网返回 ERR_NGROK_3200),
+# ngrok agent 可能"进程活着、web 面板在听、但隧道已经掉了"(公网返回 ERR_NGROK_3200),
 # 它跟服务器断开后不一定自己退出。所以判断依据是 tunnels 列表里有没有东西:
 #   有隧道 -> 真的在工作, 退出别打扰
 #   没隧道 -> agent 是个空壳, 必须先杀掉再重建(免费号同 token 只允许一条在线,
 #             不杀干净新的会因 ERR_NGROK_108 起不来)
-TUNNELS="$(curl -s -m 4 http://127.0.0.1:4040/api/tunnels 2>/dev/null)"
+# web 面板端口必须用 config 的 ngrok-web-port: 同机其他 ngrok(如 Rikkahub 的)可能占 4040,
+# 写死 4040 会误读别人家的隧道列表, 判活直接误判"在跑"然后退出。
+NG_WEB="${CFG_NGROK_WEB_PORT:-4040}"
+TUNNELS="$(curl -s -m 4 http://127.0.0.1:${NG_WEB}/api/tunnels 2>/dev/null)"
 if [ -n "$TUNNELS" ]; then
   if echo "$TUNNELS" | grep -q '"public_url"'; then
     echo "[run-ngrok] 隧道在跑, 退出: $(echo "$TUNNELS" | grep -o '"public_url":"[^"]*"' | head -1)"
@@ -70,7 +73,7 @@ cat > "$NG_CFG" <<EOF
 version: "2"
 authtoken: $NG_TOKEN
 region: $NG_REGION
-web_addr: 127.0.0.1:4040
+web_addr: 127.0.0.1:${NG_WEB}
 log: stdout
 log_level: info
 
