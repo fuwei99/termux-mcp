@@ -10,3 +10,5 @@ ngrok
 processes.jsonc
 processes.json
 ngrok.runtime.yml
+tunnels.jsonc
+tunnels.json

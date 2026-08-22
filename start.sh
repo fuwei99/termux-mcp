@@ -140,94 +140,28 @@ else
     echo "[2/4] 子节点模式, 跳过 Hub"
 fi
 
-# 4. ngrok 隧道 —— 暴露 $TUNNEL_PORT
-#    可配置关闭: config.jsonc 的 "ngrok": false 时只跑本地 MCP,
-#    适合由外部守护器(Rikkahub scheduled_processes / ngrok_tunnels.py)代管隧道的节点。
+# 4. 隧道 —— 统一由 ngrok_tunnels.py 守护器管理 (与 MCP 解耦, 配置见 tunnels.jsonc)
+#    可配置关闭: config.jsonc 的 "ngrok": false 时只跑本地 MCP
 NGROK_ON="$(echo "${CFG_ENABLE_NGROK:-true}" | tr 'A-Z' 'a-z')"
 if [ "$NGROK_ON" = "false" ]; then
-    echo "[3/4] ⚙️ 已按配置跳过 ngrok (config.jsonc \"ngrok\": false)"
+    echo "[3/4] ⚙️ 已按配置跳过隧道 (config.jsonc \"ngrok\": false)"
     echo "[4/4] 本机端点: http://127.0.0.1:$TUNNEL_PORT/sse"
     echo ""
     echo "🚀 本地模式运行中(无公网隧道)! 日志: tail -f logs/mcp.log"
     exit 0
 fi
-NGROK_BIN=""
-if command -v ngrok >/dev/null 2>&1; then
-    NGROK_BIN="ngrok"
-elif [ -x "$DIR/ngrok" ]; then
-    NGROK_BIN="$DIR/ngrok"
-fi
-
-if [ -n "$NGROK_BIN" ]; then
-    echo "[3/4] 启动 ngrok 隧道 -> :$TUNNEL_PORT  ($TUNNEL_HINT)"
-    pkill -9 -f "ngrok.runtime.yml" >/dev/null 2>&1
-    sleep 0.5
-
-    # 隧道配置: 有 config 的 ngrok-authtoken 就现生成一份 ngrok.runtime.yml,
-    # 否则沿用仓库自带的 ngrok.yml (但 addr 需按 mode 改, 所以同样重写一份)
-    NG_CFG="$DIR/ngrok.runtime.yml"
-    NG_TOKEN="$CFG_NGROK_TOKEN"
-    if [ -z "$NG_TOKEN" ] && [ -f "$DIR/ngrok.yml" ]; then
-        NG_TOKEN="$(grep -E '^authtoken:' "$DIR/ngrok.yml" | head -1 | sed 's/^authtoken:[[:space:]]*//')"
-    fi
-    NG_REGION="ap"
-    [ -f "$DIR/ngrok.yml" ] && NG_REGION="$(grep -E '^region:' "$DIR/ngrok.yml" | head -1 | sed 's/^region:[[:space:]]*//')"
-    [ -z "$NG_REGION" ] && NG_REGION="ap"
-
-    if [ -n "$NG_TOKEN" ]; then
-        cat > "$NG_CFG" <<EOF
-# 本文件由 start.sh 按 config.jsonc 的 mode 自动生成, 改它没用, 改 config.jsonc
-version: "2"
-authtoken: $NG_TOKEN
-region: $NG_REGION
-web_addr: 127.0.0.1:$NG_WEB_PORT
-log: stdout
-log_level: info
-
-tunnels:
-  termux-mcp:
-    proto: http
-    addr: $TUNNEL_PORT
-EOF
-        if command -v termux-chroot >/dev/null 2>&1; then
-            termux-chroot $NGROK_BIN start --config "$NG_CFG" termux-mcp > "$DIR/logs/ngrok.log" 2>&1 &
-        else
-            $NGROK_BIN start --config "$NG_CFG" termux-mcp > "$DIR/logs/ngrok.log" 2>&1 &
-        fi
-
-        TUNNEL_URL=""
-        for i in {1..10}; do
-            sleep 1
-            TUNNEL_URL=$(curl -s "http://127.0.0.1:$NG_WEB_PORT/api/tunnels" 2>/dev/null | grep -o '"public_url":"https://[^"]*"' | head -n 1 | cut -d '"' -f 4)
-            [ -n "$TUNNEL_URL" ] && break
-        done
-
-        if [ -n "$TUNNEL_URL" ]; then
-            echo "[4/4] 🌐 公网地址: $TUNNEL_URL/sse"
-            echo ""
-            echo "============================================================"
-            echo " Rikkahub 添加此 MCP 即可接入 ($TUNNEL_HINT):"
-            echo ""
-            echo " URL:     $TUNNEL_URL/sse"
-            echo " Headers:"
-            echo "   Authorization: Bearer $TOKEN"
-            echo "   ngrok-skip-browser-warning: true"
-            if [ "$MODE" = "root" ]; then
-                echo ""
-                echo " ⚠️ 母节点模式: 所有设备都通过这一个端点操作(工具带 device 参数),"
-                echo "    Rikkahub 里各子节点的独立 MCP 可以停用了。"
-            fi
-            echo "============================================================"
-        else
-            echo "      ⚠️ ngrok 未能在 10 秒内建立隧道, 查看 logs/ngrok.log:"
-            tail -n 10 logs/ngrok.log 2>/dev/null
-        fi
+if [ -f "$DIR/ngrok_tunnels.py" ] && { [ -x "$DIR/ngrok" ] || command -v ngrok >/dev/null 2>&1; }; then
+    echo "[3/4] 启动隧道守护器 ngrok_tunnels.py (多隧道统一管理, 配置 tunnels.jsonc)"
+    if pgrep -f ngrok_tunnels.py >/dev/null 2>&1; then
+        echo "      守护器已在跑, 跳过"
     else
-        echo "      ⚠️ 未找到 ngrok authtoken (config.jsonc 的 ngrok-authtoken 或 ngrok.yml)"
+        setsid nohup python3 "$DIR/ngrok_tunnels.py" >> "$DIR/logs/tunnels.log" 2>&1 < /dev/null &
+        echo "      守护器 PID: $!"
     fi
+    sleep 3
+    python3 "$DIR/ngrok_tunnels.py" --status 2>&1 | sed 's/^/      /'
 else
-    echo "[3/4] ℹ️ 未发现 ngrok 二进制"
-    echo "[4/4] 本机端点: http://127.0.0.1:$TUNNEL_PORT/sse"
+    echo "[3/4] ⚠️ 未发现 ngrok 二进制或 ngrok_tunnels.py (先跑 install.sh 装 ngrok)"
 fi
 
 echo ""

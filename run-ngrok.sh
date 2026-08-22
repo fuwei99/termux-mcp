@@ -1,91 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# 只跑 ngrok 隧道。暴露哪个端口由 config.jsonc 的 mode 决定:
-#   root  -> ports.hub  (母节点, Rikkahub 连它一个端点管所有设备)
-#   child -> ports.mcp  (子节点, 只暴露本机能力)
-# 给 supervisor.py 用: ngrok 是最容易被 HyperOS 杀的, 守护它是重点。
-DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$DIR" || exit 1
-mkdir -p logs
-
-eval "$(python3 read-config.py 2>/dev/null)"
-MODE="${MODE:-child}"
-PORT="${TERMUX_MCP_PORT:-${CFG_MCP_PORT:-8996}}"
-HUB_PORT="${TERMUX_HUB_PORT:-${CFG_HUB_PORT:-8994}}"
-
-if [ "$MODE" = "root" ]; then
-  TUNNEL_PORT="$HUB_PORT"
-else
-  TUNNEL_PORT="$PORT"
-fi
-
-# ngrok agent 可能"进程活着、web 面板在听、但隧道已经掉了"(公网返回 ERR_NGROK_3200),
-# 它跟服务器断开后不一定自己退出。所以判断依据是 tunnels 列表里有没有东西:
-#   有隧道 -> 真的在工作, 退出别打扰
-#   没隧道 -> agent 是个空壳, 必须先杀掉再重建(免费号同 token 只允许一条在线,
-#             不杀干净新的会因 ERR_NGROK_108 起不来)
-# web 面板端口必须用 config 的 ngrok-web-port: 同机其他 ngrok(如 Rikkahub 的)可能占 4040,
-# 写死 4040 会误读别人家的隧道列表, 判活直接误判"在跑"然后退出。
-NG_WEB="${CFG_NGROK_WEB_PORT:-4040}"
-TUNNELS="$(curl -s -m 4 http://127.0.0.1:${NG_WEB}/api/tunnels 2>/dev/null)"
-if [ -n "$TUNNELS" ]; then
-  if echo "$TUNNELS" | grep -q '"public_url"'; then
-    echo "[run-ngrok] 隧道在跑, 退出: $(echo "$TUNNELS" | grep -o '"public_url":"[^"]*"' | head -1)"
-    exit 0
-  fi
-  echo "[run-ngrok] ⚠️ agent 活着但没有隧道(空壳), 杀掉重建"
-  pkill -f ngrok
-  sleep 3
-fi
-
-# DNS: Go 的解析器碰上不可达的首个 nameserver 会死等, 顺手校正
-if [ -n "$PREFIX" ] && [ -d "$PREFIX/etc" ]; then
-  if [ ! -s "$PREFIX/etc/resolv.conf" ] || grep -qE "::1|^nameserver 1\.1\.1\.1" "$PREFIX/etc/resolv.conf"; then
-    printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 8.8.8.8\noptions timeout:1 attempts:2\n' > "$PREFIX/etc/resolv.conf"
-  fi
-fi
-
-NGROK_BIN=""
-if command -v ngrok >/dev/null 2>&1; then
-  NGROK_BIN="ngrok"
-elif [ -x "$DIR/ngrok" ]; then
-  NGROK_BIN="$DIR/ngrok"
-else
-  echo "[run-ngrok] ❌ 找不到 ngrok 二进制"
-  exit 1
-fi
-
-# token: config.jsonc 优先, 否则沿用仓库 ngrok.yml 里的
-NG_TOKEN="$CFG_NGROK_TOKEN"
-NG_REGION="ap"
-if [ -f "$DIR/ngrok.yml" ]; then
-  [ -z "$NG_TOKEN" ] && NG_TOKEN="$(grep -E '^authtoken:' "$DIR/ngrok.yml" | head -1 | sed 's/^authtoken:[[:space:]]*//')"
-  R="$(grep -E '^region:' "$DIR/ngrok.yml" | head -1 | sed 's/^region:[[:space:]]*//')"
-  [ -n "$R" ] && NG_REGION="$R"
-fi
-if [ -z "$NG_TOKEN" ]; then
-  echo "[run-ngrok] ❌ 没有 authtoken (config.jsonc 的 ngrok-authtoken 或 ngrok.yml)"
-  exit 1
-fi
-
-NG_CFG="$DIR/ngrok.runtime.yml"
-cat > "$NG_CFG" <<EOF
-# 由 run-ngrok.sh 按 config.jsonc 的 mode 自动生成, 改它没用, 改 config.jsonc
-version: "2"
-authtoken: $NG_TOKEN
-region: $NG_REGION
-web_addr: 127.0.0.1:${NG_WEB}
-log: stdout
-log_level: info
-
-tunnels:
-  termux-mcp:
-    proto: http
-    addr: $TUNNEL_PORT
-EOF
-
-echo "[run-ngrok] mode=$MODE 隧道 -> :$TUNNEL_PORT"
-if command -v termux-chroot >/dev/null 2>&1; then
-  exec termux-chroot "$NGROK_BIN" start --config "$NG_CFG" termux-mcp >> logs/ngrok.log 2>&1
-else
-  exec "$NGROK_BIN" start --config "$NG_CFG" termux-mcp >> logs/ngrok.log 2>&1
-fi
+# ============================================================
+# 已废弃: 隧道统一由 ngrok_tunnels.py 守护器管理 (与 MCP 解耦)。
+#   - 配置: tunnels.jsonc (cp tunnels.jsonc.example tunnels.jsonc)
+#   - 启动: python3 ngrok_tunnels.py
+#   - 保活: supervisor 的 processes.jsonc 里 "tunnels" 条目已接管
+# 本文件仅保留兼容旧 processes.jsonc, 不会再被新配置调用。
+# ============================================================
+echo "[run-ngrok] ⚠️ 已废弃, 隧道由 ngrok_tunnels.py 统一管理 (配置 tunnels.jsonc)"
+exit 0

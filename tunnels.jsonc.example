@@ -1,0 +1,42 @@
+// ============================================================
+// ngrok 多隧道配置  ——  复制为 tunnels.jsonc 后按机器改
+//     cp tunnels.jsonc.example tunnels.jsonc
+// 由 ngrok_tunnels.py 守护器统一管理, 与 MCP(termux_mcp.py) 完全解耦。
+// 一条隧道 = 一个 token(一个账号) = 一个独立 ngrok 进程 = 一个独立 web 面板端口。
+// 免费号同一 token 只允许一条 agent 在线, 每台设备用各自的号。
+// 以后要接其他隧道(comfyui / 备用口子 / 其他端口), 往 tunnels 加条目即可。
+//
+// 字段:
+//   device        本机身份。只拉起 tunnels 里 device 等于它的隧道。
+//                 (可用环境变量 NGROK_DEVICE 覆盖)
+//   web_port_base 隧道 web 面板端口起点, 自动递增分配。默认 4040;
+//                 同机有其他 ngrok(如 Rikkahub 的)占 4040 时务必改大避开。
+//   restart_delay 隧道死后等几秒再拉起
+//   max_failures  连续失败几次后放弃 (0 = 永不放弃)
+//   tunnels[].static_domain  免费号自带静态域名(三词组合.ngrok-free.dev),
+//                 填了则显式锁定; 留空 ngrok 自动用账号默认的, 起来后抓回填。
+// ============================================================
+{
+  "device": "pad-termux",
+
+  "settings": {
+    "web_port_base": 4045,
+    "restart_delay": 10,
+    "max_failures": 5
+  },
+
+  "tunnels": [
+    {
+      "id": "pad-termux-mcp",
+      "enabled": true,
+      "device": "pad-termux",
+      "email": "yajisa9053@prodbits.com",
+      "token": "在这里填 ngrok authtoken",
+      "static_domain": "",
+      "port": "8998",
+      "proto": "http",
+      "region": "ap",
+      "备注": "本机 Termux MCP (8998) 主隧道"
+    }
+  ]
+}

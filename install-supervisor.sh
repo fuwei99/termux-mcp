@@ -70,20 +70,125 @@ PY
     fi
 fi
 
-# ── 按 ngrok 开关关掉 processes.jsonc 里的 ngrok 条目 ──────
+# ── 隧道条目迁移: 老 processes.jsonc 的 ngrok 条目 → tunnels 守护器条目 ──
+# 隧道已与 MCP 解耦, 由 ngrok_tunnels.py 统一管理 (配置 tunnels.jsonc)
+python3 - "$DIR/processes.jsonc" <<'PY'
+import re, sys
+p = sys.argv[1]
+t = open(p, encoding='utf-8').read()
+if not re.search(r'"id":\s*"ngrok"', t):
+    sys.exit(0)
+
+def find_block(s, key):
+    """定位某 id 条目的 { ... } 块。跳过注释(// /* */)和字符串里的括号干扰。"""
+    m = re.search(r'"id":\s*"' + key + r'"', s)
+    if not m:
+        return None
+    # 1. 从 0 扫到 key, 记录最后一个不在注释/字符串里的 '{' 作为条目起点
+    last, i, n = None, 0, m.start()
+    in_line = in_block = in_str = False
+    while i < n:
+        c, nxt = s[i], s[i+1] if i+1 < n else ''
+        if in_str:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif in_line:
+            if c == '\n':
+                in_line = False
+        elif in_block:
+            if c == '*' and nxt == '/':
+                in_block = False
+                i += 1
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '/' and nxt == '/':
+                in_line = True
+                i += 1
+            elif c == '/' and nxt == '*':
+                in_block = True
+                i += 1
+            elif c == '{':
+                last = i
+        i += 1
+    if last is None:
+        return None
+    # 2. 从起点平衡括号找结束
+    depth, i, n = 0, last, len(s)
+    in_line = in_block = in_str = False
+    while i < n:
+        c, nxt = s[i], s[i+1] if i+1 < n else ''
+        if in_str:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif in_line:
+            if c == '\n':
+                in_line = False
+        elif in_block:
+            if c == '*' and nxt == '/':
+                in_block = False
+                i += 1
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '/' and nxt == '/':
+                in_line = True
+                i += 1
+            elif c == '/' and nxt == '*':
+                in_block = True
+                i += 1
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return last, i + 1
+        i += 1
+    return None
+
+blk = find_block(t, 'ngrok')
+if blk:
+    start, end = blk
+    j = end
+    while j < len(t) and t[j] in ' \t\n,':
+        j += 1
+    tunnels_block = ('    {\n'
+        '      // 隧道守护器: 按 tunnels.jsonc 统一管所有隧道, 与 MCP 解耦。\n'
+        '      "id": "tunnels",\n'
+        '      "name": "ngrok 多隧道守护器 (ngrok_tunnels.py, 按 tunnels.jsonc 管隧道)",\n'
+        '      "enabled": true,\n'
+        '      "command": "python3 ngrok_tunnels.py",\n'
+        '      "cwd": ".",\n'
+        '      "check": { "pgrep": "ngrok_tunnels.py" },\n'
+        '      "grace": 15,\n'
+        '      "restartDelay": 5,\n'
+        '      "maxConsecutiveStartFailures": 0\n'
+        '    },')
+    t = t[:start] + tunnels_block + t[j:]
+    open(p, 'w', encoding='utf-8').write(t)
+    print("      ✅ 已迁移 processes.jsonc: ngrok 条目 -> tunnels 守护器条目 (隧道与 MCP 解耦)")
+PY
+
+# ── 按 ngrok 开关关掉 processes.jsonc 里的隧道条目 ──────
 # config.jsonc "ngrok": false = 隧道由外部守护器管, supervisor 不碰它
 NGROK_ON="$(echo "${CFG_ENABLE_NGROK:-true}" | tr 'A-Z' 'a-z')"
-if [ "$NGROK_ON" != "true" ] && [ -f "$DIR/processes.jsonc" ] && grep -q '"id": *"ngrok"' "$DIR/processes.jsonc"; then
+if [ "$NGROK_ON" != "true" ] && [ -f "$DIR/processes.jsonc" ]; then
     python3 - "$DIR/processes.jsonc" <<'PY'
 import re, sys
 p = sys.argv[1]
 t = open(p, encoding='utf-8').read()
-t2 = re.sub(r'("id":\s*"ngrok",.*?)"enabled":\s*true', r'\1"enabled": false', t, flags=re.S)
+t2 = re.sub(r'("id":\s*"(?:ngrok|tunnels)",.*?)"enabled":\s*true', r'\1"enabled": false', t, flags=re.S)
 if t2 != t:
     open(p, 'w', encoding='utf-8').write(t2)
-    print("      ⚙️ config \"ngrok\": false -> processes.jsonc 里 ngrok 条目已关闭 (交给外部守护器)")
+    print("      ⚙️ config \"ngrok\": false -> processes.jsonc 里隧道条目已关闭 (交给外部守护器)")
 else:
-    print("      ⚙️ config \"ngrok\": false (ngrok 条目已是关闭状态)")
+    print("      ⚙️ config \"ngrok\": false (隧道条目已是关闭状态)")
 PY
 fi
 

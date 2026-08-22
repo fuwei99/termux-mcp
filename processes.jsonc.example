@@ -39,18 +39,16 @@
       "maxConsecutiveStartFailures": 0
     },
     {
-      // ngrok 最容易被 HyperOS 杀, 守护它才是这套东西的主要意义
-      // 判活必须用 tunnel 而不是 {"port":4040}: agent 可能进程活着、4040 在听、
-      // 但隧道早掉了(公网 ERR_NGROK_3200), 只看端口会误判成"还活着"而不重启。
-      // tunnel 会去 4040 API 查 tunnels 列表, 空列表 = 空壳 = 判死。
-      // 值可以写 true(有任意隧道即可)或域名片段(如 "chant-enunciate" 精确校验)。
-      "id": "ngrok",
-      "name": "ngrok 隧道 (按 config.jsonc 的 mode 暴露 hub 或 mcp 端口)",
+      // 隧道守护器: 按 tunnels.jsonc 统一管所有隧道, 与 MCP 解耦。
+      // 它自己再拉 ngrok 子进程; 守护器进程活着 = 隧道有人管。
+      // 判活用 pgrep 而非 http: 守护器死了隧道迟早全掉, 必须拉起它。
+      "id": "tunnels",
+      "name": "ngrok 多隧道守护器 (ngrok_tunnels.py, 按 tunnels.jsonc 管隧道)",
       "enabled": true,
-      "command": "bash run-ngrok.sh",
+      "command": "python3 ngrok_tunnels.py",
       "cwd": ".",
-      "check": { "tunnel": true },
-      "grace": 25,        // ngrok 建隧道慢, 多给点时间
+      "check": { "pgrep": "ngrok_tunnels.py" },
+      "grace": 15,
       "restartDelay": 5,
       "maxConsecutiveStartFailures": 0
     },
