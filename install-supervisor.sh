@@ -87,6 +87,21 @@ else:
 PY
 fi
 
+# ── 按 config 端口修正 check URL ────────────────────────────
+# processes.jsonc.example 里 termux-mcp 判活硬编码 8996 / hub 硬编码 8994,
+# 但 config.jsonc 的 ports.mcp / ports.hub 可能不同(如 8998)。不修会误报死。
+MCP_PORT="${CFG_MCP_PORT:-8996}"
+HUB_PORT="${CFG_HUB_PORT:-8994}"
+python3 - "$DIR/processes.jsonc" "$MCP_PORT" "$HUB_PORT" <<'PY'
+import sys
+p, mp, hp = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(p, encoding='utf-8').read()
+t = t.replace('http://127.0.0.1:8996/health', f'http://127.0.0.1:{mp}/health')
+t = t.replace('http://127.0.0.1:8994/health', f'http://127.0.0.1:{hp}/health')
+open(p, 'w', encoding='utf-8').write(t)
+print(f"      ✅ check URL 端口已按 config 修正 (mcp={mp}, hub={hp})")
+PY
+
 # ── Termux:Boot ─────────────────────────────────────────────
 echo "=== [2/4] 配置开机自启 (Termux:Boot) ==="
 BOOT_DIR="$HOME/.termux/boot"
