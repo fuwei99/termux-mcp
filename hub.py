@@ -335,13 +335,17 @@ _tools_lock = threading.Lock()
 
 
 def _device_prop() -> dict:
+    """device 参数的 schema。
+
+    只给一行枚举 + 一句提示, 不逐台展开 note —— 否则每台设备的网络链路说明
+    会在 9+ 个工具里各复制一遍, 一轮对话白烧上千 token。
+    设备详情(note/url/在线状态)由 devices 工具负责, 别在这念经。
+    """
     names = list(CFG.nodes)
     if names:
-        lines = ["目标设备 (可选):"]
-        for n in names:
-            note = (CFG.nodes[n].get("note") or "").strip()
-            lines.append(f"- {n}" + (f": {note}" if note else ""))
-        return {"type": "string", "description": "\n".join(lines), "enum": names}
+        return {"type": "string",
+                "description": "目标设备: " + " / ".join(names) + " (详情见 devices 工具)",
+                "enum": names}
     return {"type": "string", "description": "目标设备: (未配置节点)"}
 
 

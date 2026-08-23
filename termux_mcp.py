@@ -1559,14 +1559,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "shell_session",
-        "description": (
-            "常驻 pty bash 会话 + 后台长任务。cd/export/变量在同 session_id 间持久保持。\n"
-            "**超时不杀命令**: 返回 still_running=true, 用 action=read 接着读输出(持久缓冲+游标, 不丢)。\n"
-            "action: exec(默认, 跑命令) / read(续读) / write(喂 stdin, 答 y/n、REPL) / "
-            "interrupt(真 Ctrl-C) / close(强杀会话) / info / list / "
-            "bg_start(detach 长任务, 输出落盘) / bg_read / bg_kill / bg_list。\n"
-            "几分钟以上的长任务用 bg_start, 别用 exec 干等。"
-        ),
+        "description": "常驻 pty bash 会话+后台长任务。action: exec/read/write/interrupt/close/info/list/bg_start/bg_read/bg_kill/bg_list; 超时不杀命令, read 续读。",
         "inputSchema": {
             "type": "object",
             "properties": {
