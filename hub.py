@@ -194,12 +194,16 @@ def _create_connection_ipv4_first(address: tuple[str, int], timeout: float = CON
     except Exception as e:
         raise e
     addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
-    for af, socktype, proto, canonname, sa in addrs:
+    deadline = time.time() + (timeout or 2.5)
+    # 最多尝试前 2 个地址 (优先 IPv4), 绝不傻等 5 个 IP 轮询
+    for af, socktype, proto, canonname, sa in addrs[:2]:
+        remain = deadline - time.time()
+        if remain <= 0:
+            break
         sock = None
         try:
             sock = socket.socket(af, socktype, proto)
-            if timeout is not None:
-                sock.settimeout(timeout)
+            sock.settimeout(min(remain, 1.5))
             if source_address:
                 sock.bind(source_address)
             sock.connect(sa)
@@ -213,7 +217,7 @@ def _create_connection_ipv4_first(address: tuple[str, int], timeout: float = CON
                     pass
     if err is not None:
         raise err
-    raise OSError("getaddrinfo returns an empty list")
+    raise TimeoutError(f"建连超时 (>{timeout:.1f}s)")
 
 
 class _IPv4FirstHTTPConnection(http.client.HTTPConnection):
@@ -498,9 +502,11 @@ def tool_devices(probe: bool = True) -> dict:
                    for name, cfg in CFG.nodes.items()}
         for name in CFG.nodes:
             try:
-                lines.append(futures[name].result(timeout=PROBE_TIMEOUT + 1.0))
+                lines.append(futures[name].result(timeout=PROBE_TIMEOUT + 3.0))
             except Exception as e:
-                lines.append(f"  {name:6s} ❌ 探活异常: {e}")
+                err_msg = type(e).__name__ if not str(e) else str(e)
+                lines.append(f"  {name:6s} {CFG.nodes[name]['url']}
+         ❌ 探活超时/异常: {err_msg}")
     return _text_result("\n".join(lines))
 
 
