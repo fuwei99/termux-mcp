@@ -128,9 +128,12 @@ class Config:
             url = str(cfg.get("url") or "").strip()
             if not url:
                 continue
+            lan_url = str(cfg.get("lan_url") or "").strip()
             self.nodes[str(name)] = {
                 "url": url,
                 "rpc_url": self._to_rpc(url),
+                "lan_url": lan_url,
+                "lan_rpc_url": self._to_rpc(lan_url) if lan_url else "",
                 "headers": self._headers(cfg),
                 "note": str(cfg.get("note") or ""),
             }
@@ -147,7 +150,7 @@ class Config:
     @staticmethod
     def _headers(cfg: dict) -> dict[str, str]:
         """除 url/note/enabled 外的键都当 HTTP header 透传(Authorization 等)。"""
-        skip = {"url", "note", "enabled", "local"}
+        skip = {"url", "lan_url", "note", "enabled", "local"}
         h = {"ngrok-skip-browser-warning": "true"}
         for k, v in cfg.items():
             if k in skip or v is None:
@@ -230,13 +233,13 @@ class _IPv4FirstHTTPSConnection(http.client.HTTPSConnection):
         return _create_connection_ipv4_first(address, timeout, source_address)
 
 
-def _new_conn(scheme: str, netloc: str):
+def _new_conn(scheme: str, netloc: str, connect_timeout: float = CONNECT_TIMEOUT):
     host, _, port = netloc.partition(":")
     port_i = int(port) if port else (443 if scheme == "https" else 80)
     if scheme == "https":
-        conn = _IPv4FirstHTTPSConnection(host, port_i, timeout=CONNECT_TIMEOUT)
+        conn = _IPv4FirstHTTPSConnection(host, port_i, timeout=connect_timeout)
     else:
-        conn = _IPv4FirstHTTPConnection(host, port_i, timeout=CONNECT_TIMEOUT)
+        conn = _IPv4FirstHTTPConnection(host, port_i, timeout=connect_timeout)
     conn.connect()                       # 显式建连, 用较短的 CONNECT_TIMEOUT
     return conn
 
@@ -472,14 +475,18 @@ def _text_result(text: str, is_error: bool = False) -> dict:
 
 def _probe_single_node(name: str, cfg: dict) -> str:
     tag = f"  {name:6s} {cfg['url']}"
+    if cfg.get("lan_url"):
+        tag += f"  (LAN: {cfg['lan_url']})"
     if cfg.get("note"):
         tag += f"  ({cfg['note']})"
     t0 = time.time()
     r = node_rpc(name, "tools/list", timeout=PROBE_TIMEOUT)
     dt = time.time() - t0
+    ch = r.get("_channel")
+    channel_desc = f" [{ch}直连]" if ch == "LAN" else (f" [{ch}隧道]" if ch == "WAN" else "")
     if r.get("result"):
         n = len((r["result"] or {}).get("tools") or [])
-        tag += f"\n         ✅ 在线 {dt:.2f}s  工具 {n} 个"
+        tag += f"\n         ✅ 在线{channel_desc} {dt:.2f}s  工具 {n} 个"
     else:
         tag += f"\n         ❌ {r.get('error')}"
     return tag

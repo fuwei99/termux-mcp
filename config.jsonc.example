@@ -44,6 +44,7 @@
   // key   = device 参数的值 (调工具时传 device: "k70")
   // url   = 该设备 termux_mcp.py 的 SSE 端点; hub 内部会自动换成 /mcp 打无状态请求
   //         本机节点写 127.0.0.1 —— 不过公网, 最快
+  // lan_url = 局域网直连端点 (可选)。同 Wi-Fi 下优先直连(0.01s), 内网不通自动 fallback 公网 url
   // 其余键(Authorization / 任意 header)原样作为 HTTP header 透传
   // enabled: false 可临时摘掉某台
   "nodes": {
@@ -58,6 +59,13 @@
       "ngrok-skip-browser-warning": true,
       "note": "主力机 K70 (HyperOS, 需保活六件套)"
     }
+    // 局域网直连 + ngrok 兜底配置示例:
+    // "pad-rikkahub": {
+    //   "lan_url": "http://192.168.10.39:8997/sse",
+    //   "url": "https://embattled-smuggler-amino.ngrok-free.dev/sse",
+    //   "Authorization": "Bearer wei123..",
+    //   "note": "平板 workspace"
+    // }
     // 新设备接入 = 在这里加一行, 母节点重启即生效, 不用改代码
     // "k40": {
     //   "url": "https://xxxx.ngrok-free.dev/sse",
