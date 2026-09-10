@@ -505,8 +505,7 @@ def tool_devices(probe: bool = True) -> dict:
                 lines.append(futures[name].result(timeout=PROBE_TIMEOUT + 3.0))
             except Exception as e:
                 err_msg = type(e).__name__ if not str(e) else str(e)
-                lines.append(f"  {name:6s} {CFG.nodes[name]['url']}
-         ❌ 探活超时/异常: {err_msg}")
+                lines.append(f"  {name:6s} {CFG.nodes[name]['url']}\n         ❌ 探活超时/异常: {err_msg}")
     return _text_result("\n".join(lines))
 
 
