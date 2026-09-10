@@ -35,6 +35,7 @@ wheel, Termux 装不上。这里手写 JSON-RPC + SSE, 只用 http.server/http.c
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import http.client
 import json
 import os
@@ -55,9 +56,9 @@ VERSION = "1.0.0"
 PROTOCOL_VERSION = "2024-11-05"
 BASE = Path(__file__).resolve().parent
 
-CONNECT_TIMEOUT = 8.0         # 建连超时: 设备离线时快速失败, 不拖累其他设备
+CONNECT_TIMEOUT = 3.0         # 建连超时: 3s 快速失败, 探活/离线不拖累其他设备
 DEFAULT_TIMEOUT = 180.0       # 工具调用读超时
-PROBE_TIMEOUT = 6.0           # termux_devices / health 探活超时
+PROBE_TIMEOUT = 3.0           # termux_devices / health 探活超时
 CONN_IDLE_MAX = 240.0         # 空闲连接最长复用寿命(秒)
 TOOLS_CACHE_TTL = 300.0       # 工具表缓存
 
@@ -183,13 +184,55 @@ _IDLE: dict[tuple, list] = {}
 _IDLE_LOCK = threading.Lock()
 
 
+def _create_connection_ipv4_first(address: tuple[str, int], timeout: float = CONNECT_TIMEOUT,
+                                  source_address: Optional[tuple] = None) -> socket.socket:
+    """建连: 强制 IPv4 优先 (解决 Android/Termux 局域网无公网路由 IPv6 黑洞吞 SYN 死等超时问题)。"""
+    host, port = address
+    err = None
+    try:
+        addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        raise e
+    addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+    for af, socktype, proto, canonname, sa in addrs:
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if timeout is not None:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except Exception as e:
+            err = e
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    if err is not None:
+        raise err
+    raise OSError("getaddrinfo returns an empty list")
+
+
+class _IPv4FirstHTTPConnection(http.client.HTTPConnection):
+    def _create_connection(self, address, timeout=CONNECT_TIMEOUT, source_address=None):
+        return _create_connection_ipv4_first(address, timeout, source_address)
+
+
+class _IPv4FirstHTTPSConnection(http.client.HTTPSConnection):
+    def _create_connection(self, address, timeout=CONNECT_TIMEOUT, source_address=None):
+        return _create_connection_ipv4_first(address, timeout, source_address)
+
+
 def _new_conn(scheme: str, netloc: str):
     host, _, port = netloc.partition(":")
     port_i = int(port) if port else (443 if scheme == "https" else 80)
     if scheme == "https":
-        conn = http.client.HTTPSConnection(host, port_i, timeout=CONNECT_TIMEOUT)
+        conn = _IPv4FirstHTTPSConnection(host, port_i, timeout=CONNECT_TIMEOUT)
     else:
-        conn = http.client.HTTPConnection(host, port_i, timeout=CONNECT_TIMEOUT)
+        conn = _IPv4FirstHTTPConnection(host, port_i, timeout=CONNECT_TIMEOUT)
     conn.connect()                       # 显式建连, 用较短的 CONNECT_TIMEOUT
     return conn
 
@@ -423,23 +466,41 @@ def _text_result(text: str, is_error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
+def _probe_single_node(name: str, cfg: dict) -> str:
+    tag = f"  {name:6s} {cfg['url']}"
+    if cfg.get("note"):
+        tag += f"  ({cfg['note']})"
+    t0 = time.time()
+    r = node_rpc(name, "tools/list", timeout=PROBE_TIMEOUT)
+    dt = time.time() - t0
+    if r.get("result"):
+        n = len((r["result"] or {}).get("tools") or [])
+        tag += f"\n         ✅ 在线 {dt:.2f}s  工具 {n} 个"
+    else:
+        tag += f"\n         ❌ {r.get('error')}"
+    return tag
+
+
 def tool_devices(probe: bool = True) -> dict:
     lines = [f"母节点 mode={CFG.mode}  hub :{CFG.hub_port}  本机 mcp :{CFG.mcp_port}",
              f"节点数 {len(CFG.nodes)}"]
-    for name, cfg in CFG.nodes.items():
-        tag = f"  {name:6s} {cfg['url']}"
-        if cfg["note"]:
-            tag += f"  ({cfg['note']})"
-        if probe:
-            t0 = time.time()
-            r = node_rpc(name, "tools/list", timeout=PROBE_TIMEOUT)
-            dt = time.time() - t0
-            if r.get("result"):
-                n = len((r["result"] or {}).get("tools") or [])
-                tag += f"\n         ✅ 在线 {dt:.2f}s  工具 {n} 个"
-            else:
-                tag += f"\n         ❌ {r.get('error')}"
-        lines.append(tag)
+    if not probe:
+        for name, cfg in CFG.nodes.items():
+            tag = f"  {name:6s} {cfg['url']}"
+            if cfg.get("note"):
+                tag += f"  ({cfg['note']})"
+            lines.append(tag)
+        return _text_result("\n".join(lines))
+
+    # 并发探活: 所有子节点线程池并发, 耗时取决于 max(节点耗时) 而非 sum(节点耗时), 彻底解决卡死
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(CFG.nodes), 8))) as pool:
+        futures = {name: pool.submit(_probe_single_node, name, cfg)
+                   for name, cfg in CFG.nodes.items()}
+        for name in CFG.nodes:
+            try:
+                lines.append(futures[name].result(timeout=PROBE_TIMEOUT + 1.0))
+            except Exception as e:
+                lines.append(f"  {name:6s} ❌ 探活异常: {e}")
     return _text_result("\n".join(lines))
 
 
